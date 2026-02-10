@@ -1,4 +1,4 @@
-import { VoxelRenderer } from '../src/index.js';
+import { VoxelRenderer, PerformanceOverlay } from '../src/index.js';
 import { mat4Create, mat4Perspective, mat4LookAt } from '../src/gpu/math.js';
 
 // Pack RGBA color as u32 (little-endian: ABGR byte order)
@@ -80,6 +80,14 @@ async function main() {
   const { buffer, count } = buildVoxelData();
   renderer.uploadVoxels(buffer, count);
 
+  // Performance overlay
+  const overlay = new PerformanceOverlay(canvas);
+  let lastTimeMs = -1;
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'd' || e.key === 'D') overlay.cycle();
+  });
+
   // Camera setup
   const view = mat4Create();
   const proj = mat4Create();
@@ -89,6 +97,7 @@ async function main() {
 
   window.addEventListener('resize', () => {
     renderer.resize(window.innerWidth, window.innerHeight);
+    overlay.resize();
   });
 
   function frame(timeMs: number) {
@@ -111,6 +120,10 @@ async function main() {
 
     renderer.updateCamera(view, proj);
     renderer.render();
+
+    const frameDeltaMs = lastTimeMs < 0 ? 0 : timeMs - lastTimeMs;
+    lastTimeMs = timeMs;
+    overlay.update({ frameDeltaMs, voxelCount: count });
 
     requestAnimationFrame(frame);
   }

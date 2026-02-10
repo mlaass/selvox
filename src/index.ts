@@ -4,3 +4,5 @@ export type {
   IVoxelDataSource,
   VoxelDataChunk,
 } from './types.js';
+export { PerformanceOverlay, OverlayMode } from './PerformanceOverlay.js';
+export type { OverlayStats } from './PerformanceOverlay.js';
