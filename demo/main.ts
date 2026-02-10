@@ -1,84 +1,5 @@
-import { VoxelRenderer, PerformanceOverlay } from '../src/index.js';
+import { VoxelRenderer, PerformanceOverlay, MockOctreeSource, ChunkManager } from '../src/index.js';
 import { mat4Create, mat4Perspective, mat4LookAt } from '../src/gpu/math.js';
-
-const VOXEL_STRIDE = 64; // bytes per voxel
-
-// Pack RGBA color as u32 (little-endian: ABGR byte order)
-function packColor(r: number, g: number, b: number): number {
-  return (r & 0xff) | ((g & 0xff) << 8) | ((b & 0xff) << 16) | (0xff << 24);
-}
-
-function writeVoxel(
-  buf: ArrayBuffer,
-  index: number,
-  posA: [number, number, number], colorA: number, sizeA: number,
-  posB: [number, number, number], colorB: number, sizeB: number,
-): void {
-  const offset = index * VOXEL_STRIDE;
-  const f32 = new Float32Array(buf, offset, 16);
-  const u32 = new Uint32Array(buf, offset, 16);
-
-  // State A
-  f32[0] = posA[0]; f32[1] = posA[1]; f32[2] = posA[2]; f32[3] = 0;
-  u32[4] = colorA;
-  f32[5] = sizeA;
-  f32[6] = 0; f32[7] = 0;
-
-  // State B
-  f32[8] = posB[0]; f32[9] = posB[1]; f32[10] = posB[2]; f32[11] = 0;
-  u32[12] = colorB;
-  f32[13] = sizeB;
-  f32[14] = 0; f32[15] = 0;
-}
-
-// Dense chunk: 10x10x10 grid colored by height.
-// offsetA/offsetB shift the gradient for State A / State B; the GPU interpolates between them.
-function buildCityChunk(offsetA: number = 0, offsetB: number = 0): { buffer: ArrayBuffer; count: number } {
-  const N = 10;
-  const count = N * N * N;
-  const buffer = new ArrayBuffer(VOXEL_STRIDE * count);
-
-  function heightColor(y: number, offset: number): number {
-    const t = ((y / (N - 1)) + offset) % 1.0;
-    const r = Math.round(30 + (1 - t) * 100);
-    const g = Math.round(180 - t * 80);
-    const b = Math.round(60 + t * 195);
-    return packColor(r, g, b);
-  }
-
-  let idx = 0;
-  for (let y = 0; y < N; y++) {
-    const colorA = heightColor(y, offsetA);
-    const colorB = heightColor(y, offsetB);
-
-    for (let x = 0; x < N; x++) {
-      for (let z = 0; z < N; z++) {
-        const px = x - N / 2 + 0.5;
-        const py = y - N / 2 + 0.5;
-        const pz = z - N / 2 + 0.5;
-        writeVoxel(
-          buffer, idx,
-          [px, py, pz], colorA, 0.9,
-          [px, py, pz], colorB, 0.9,
-        );
-        idx++;
-      }
-    }
-  }
-
-  return { buffer, count };
-}
-
-// Sparse chunk: single large beacon voxel
-function buildBeaconChunk(): { buffer: ArrayBuffer; count: number } {
-  const buffer = new ArrayBuffer(VOXEL_STRIDE);
-  writeVoxel(
-    buffer, 0,
-    [0, 7, 0], packColor(255, 60, 30), 1.5,
-    [0, 7.5, 0], packColor(255, 220, 40), 1.8,
-  );
-  return { buffer, count: 1 };
-}
 
 async function main() {
   const canvas = document.getElementById('gpu-canvas') as HTMLCanvasElement;
@@ -104,99 +25,104 @@ async function main() {
     return;
   }
 
-  // Color cycling config
-  const CYCLE_STEPS = 10; // one step per height level
-  const CYCLE_SPEED = 0.1; // full cycle in ~10s
+  // Set up mock octree data source and chunk manager
+  const source = new MockOctreeSource(3); // 3x3x3 grid of chunk positions
+  const metadata = await source.getMetadata();
+  renderer.setDataSource(source);
 
-  function cityOffsets(step: number): [number, number] {
-    const offsetA = (1 - (step % CYCLE_STEPS) / CYCLE_STEPS) % 1.0;
-    const offsetB = (1 - ((step + 1) % CYCLE_STEPS) / CYCLE_STEPS) % 1.0;
-    return [offsetA, offsetB];
-  }
+  const chunkManager = new ChunkManager(renderer, source);
+  await chunkManager.initialize();
 
-  // Load multi-chunk scene
-  const [initA, initB] = cityOffsets(0);
-  const initialCity = buildCityChunk(initA, initB);
-  const beacon = buildBeaconChunk();
-  renderer.loadChunk('city', initialCity.buffer, initialCity.count);
-  renderer.loadChunk('beacon', beacon.buffer, beacon.count);
+  // World center from metadata (large geospatial offset)
+  const worldCenter = new Float64Array([
+    (metadata.worldBounds[0] + metadata.worldBounds[3]) * 0.5,
+    (metadata.worldBounds[1] + metadata.worldBounds[4]) * 0.5,
+    (metadata.worldBounds[2] + metadata.worldBounds[5]) * 0.5,
+  ]);
+
+  console.log(`selvox: World center at [${worldCenter[0]}, ${worldCenter[1]}, ${worldCenter[2]}] (RTE mode)`);
 
   // Performance overlay
   const overlay = new PerformanceOverlay(canvas);
   let lastTimeMs = -1;
-  let cityLoaded = true;
-  let prevStep = 0;
+
+  // Info overlay for chunk/LOD stats
+  const infoDiv = document.createElement('div');
+  infoDiv.style.cssText = 'position:fixed;bottom:8px;left:8px;color:#ccc;font:12px monospace;background:rgba(0,0,0,0.65);padding:4px 8px;border-radius:4px;pointer-events:none;z-index:9999';
+  document.body.appendChild(infoDiv);
 
   window.addEventListener('keydown', (e) => {
     if (e.key === 'd' || e.key === 'D') overlay.cycle();
+    if (e.key === 'l' || e.key === 'L') {
+      renderer.setDebugFlags(renderer.currentDebugFlags ^ 1);
+      console.log(`selvox: LOD debug ${(renderer.currentDebugFlags & 1) ? 'ON' : 'OFF'}`);
+    }
     if (e.key === 'r' || e.key === 'R') {
-      if (cityLoaded) {
-        renderer.unloadChunk('city');
-        cityLoaded = false;
-        console.log('selvox: unloaded "city" chunk');
-      } else {
-        prevStep = 0;
-        const [oA, oB] = cityOffsets(0);
-        const city = buildCityChunk(oA, oB);
-        renderer.loadChunk('city', city.buffer, city.count);
-        cityLoaded = true;
-        console.log('selvox: reloaded "city" chunk');
-      }
+      chunkManager.unloadAll();
+      console.log('selvox: force-reloaded all chunks');
     }
   });
 
-  // Camera setup
+  // Camera setup — orbit around world center
   const view = mat4Create();
   const proj = mat4Create();
-  const eye = new Float32Array(3);
-  const center = new Float32Array([0, 0, 0]);
+  // eye/center/up in RTE-local coordinates (relative to camera)
+  const eyeLocal = new Float32Array(3);
+  const centerLocal = new Float32Array([0, 0, 0]);
   const up = new Float32Array([0, 1, 0]);
+  // High-precision camera position
+  const cameraPositionHigh = new Float64Array(3);
 
   window.addEventListener('resize', () => {
     renderer.resize(window.innerWidth, window.innerHeight);
     overlay.resize();
   });
 
+  let infoUpdateCounter = 0;
+
   function frame(timeMs: number) {
     const t = timeMs * 0.001;
 
-    // Ping-pong interpolation factor 0↔1 (drives beacon position/size)
-    const interp = Math.sin(t * 0.8) * 0.5 + 0.5;
-    renderer.setTime(interp);
-
-    // Step-based color cycling — rebuild only when the step changes (~1/s)
-    if (cityLoaded) {
-      const phase = t * CYCLE_SPEED * CYCLE_STEPS;
-      const stepIndex = Math.floor(phase);
-      const colorFrac = phase - stepIndex;
-
-      if (stepIndex !== prevStep) {
-        prevStep = stepIndex;
-        const [oA, oB] = cityOffsets(stepIndex);
-        const city = buildCityChunk(oA, oB);
-        renderer.loadChunk('city', city.buffer, city.count);
-      }
-
-      renderer.setColorTime(colorFrac);
-    }
-
-    // Orbiting camera — pulled back to see full scene
+    // Orbiting camera at large world offset
     const radius = 20;
     const angle = t * 0.4;
-    eye[0] = Math.cos(angle) * radius;
-    eye[1] = 8;
-    eye[2] = Math.sin(angle) * radius;
+    const camHeight = 8;
+
+    // Camera position in world (double precision)
+    cameraPositionHigh[0] = worldCenter[0] + Math.cos(angle) * radius;
+    cameraPositionHigh[1] = worldCenter[1] + camHeight;
+    cameraPositionHigh[2] = worldCenter[2] + Math.sin(angle) * radius;
+
+    // In RTE space, eye is at the orbit offset from origin
+    // The RTE offset per-chunk will shift chunks relative to camera
+    eyeLocal[0] = Math.cos(angle) * radius;
+    eyeLocal[1] = camHeight;
+    eyeLocal[2] = Math.sin(angle) * radius;
 
     const aspect = canvas.width / canvas.height;
     mat4Perspective(proj, Math.PI / 4, aspect, 0.1, 1000);
-    mat4LookAt(view, eye, center, up);
+    mat4LookAt(view, eyeLocal, centerLocal, up);
 
-    renderer.updateCamera(view, proj);
+    // Update chunks based on camera position
+    chunkManager.update(cameraPositionHigh);
+
+    // No interpolation animation for octree demo
+    renderer.setTime(0);
+    renderer.setColorTime(0);
+
+    renderer.updateCamera(view, proj, cameraPositionHigh);
     renderer.render();
 
     const frameDeltaMs = lastTimeMs < 0 ? 0 : timeMs - lastTimeMs;
     lastTimeMs = timeMs;
     overlay.update({ frameDeltaMs, voxelCount: renderer.voxelCount });
+
+    // Update info overlay at lower frequency
+    infoUpdateCounter++;
+    if (infoUpdateCounter % 30 === 0) {
+      const lodLevels = Array.from(chunkManager.getActiveLodLevels()).sort();
+      infoDiv.textContent = `Chunks: ${renderer.chunkCount} | LODs: [${lodLevels.join(',')}] | [D]perf [L]LOD [R]reload`;
+    }
 
     requestAnimationFrame(frame);
   }

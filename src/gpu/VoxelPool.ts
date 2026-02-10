@@ -6,6 +6,9 @@ const DEFAULT_MAX_VOXELS = 1_000_000;
 export interface PoolChunkInfo {
   startSlot: number;
   voxelCount: number;
+  worldOrigin: Float64Array;
+  lodLevel: number;
+  chunkIndex: number;
 }
 
 export class VoxelPool {
@@ -13,6 +16,8 @@ export class VoxelPool {
   private allocator: BlockAllocator;
   private _buffer: GPUBuffer;
   private chunks = new Map<string, PoolChunkInfo>();
+  private nextChunkIndex = 0;
+  private freeChunkIndices: number[] = [];
 
   constructor(device: GPUDevice, maxVoxels: number = DEFAULT_MAX_VOXELS) {
     this.device = device;
@@ -35,7 +40,28 @@ export class VoxelPool {
     return total;
   }
 
-  loadChunk(id: string, data: ArrayBuffer, voxelCount: number): void {
+  get chunkCount(): number {
+    return this.chunks.size;
+  }
+
+  private allocChunkIndex(): number {
+    if (this.freeChunkIndices.length > 0) {
+      return this.freeChunkIndices.pop()!;
+    }
+    return this.nextChunkIndex++;
+  }
+
+  private freeChunkIndex(index: number): void {
+    this.freeChunkIndices.push(index);
+  }
+
+  loadChunk(
+    id: string,
+    data: ArrayBuffer,
+    voxelCount: number,
+    worldOrigin?: Float64Array,
+    lodLevel?: number,
+  ): void {
     // Replace semantics: unload existing chunk with same id
     if (this.chunks.has(id)) {
       this.unloadChunk(id);
@@ -54,13 +80,20 @@ export class VoxelPool {
       voxelCount * VOXEL_STRIDE,
     );
 
-    this.chunks.set(id, { startSlot, voxelCount });
+    this.chunks.set(id, {
+      startSlot,
+      voxelCount,
+      worldOrigin: worldOrigin ?? new Float64Array([0, 0, 0]),
+      lodLevel: lodLevel ?? 0,
+      chunkIndex: this.allocChunkIndex(),
+    });
   }
 
   unloadChunk(id: string): void {
     const info = this.chunks.get(id);
     if (!info) return;
     this.allocator.free(info.startSlot, info.voxelCount);
+    this.freeChunkIndex(info.chunkIndex);
     this.chunks.delete(id);
   }
 
@@ -68,9 +101,13 @@ export class VoxelPool {
     return this.chunks.has(id);
   }
 
-  forEachChunk(cb: (firstInstance: number, instanceCount: number) => void): void {
+  getChunkInfo(id: string): PoolChunkInfo | undefined {
+    return this.chunks.get(id);
+  }
+
+  forEachChunk(cb: (firstInstance: number, instanceCount: number, chunkInfo: PoolChunkInfo) => void): void {
     for (const info of this.chunks.values()) {
-      cb(info.startSlot, info.voxelCount);
+      cb(info.startSlot, info.voxelCount, info);
     }
   }
 

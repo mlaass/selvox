@@ -1,4 +1,4 @@
-// Phase 1 — Interpolated voxel cubes via ray-AABB intersection (Majercik 2018)
+// Phase 1–3 — Interpolated voxel cubes with RTE coordinates and LOD debug
 
 struct Uniforms {
   view_proj:      mat4x4<f32>,   // 0
@@ -9,6 +9,12 @@ struct Uniforms {
   near:           f32,           // 152
   far:            f32,           // 156
   color_t:        f32,           // 160
+  debug_flags:    u32,           // 164
+};
+
+struct ChunkUniforms {
+  rte_offset: vec3<f32>,
+  lod_level:  u32,
 };
 
 struct Voxel {
@@ -28,6 +34,7 @@ struct VoxelBuffer {
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> voxel_buf: VoxelBuffer;
+@group(1) @binding(0) var<uniform> chunk: ChunkUniforms;
 
 struct VertexOutput {
   @builtin(position) position: vec4<f32>,
@@ -36,6 +43,7 @@ struct VertexOutput {
   @location(2) box_center: vec3<f32>,
   @location(3) box_half: vec3<f32>,
   @location(4) color: vec3<f32>,
+  @location(5) @interpolate(flat) lod_level: u32,
 };
 
 fn unpack_color(c: u32) -> vec3<f32> {
@@ -54,8 +62,8 @@ fn vs_main(
   let voxel = voxel_buf.voxels[iid];
   let t = uniforms.interpolation;
 
-  // Interpolate position, size, color
-  let center = mix(voxel.pos_a.xyz, voxel.pos_b.xyz, t);
+  // Interpolate position, size, color — apply RTE offset
+  let center = mix(voxel.pos_a.xyz, voxel.pos_b.xyz, t) + chunk.rte_offset;
   let half_size = mix(voxel.size_a, voxel.size_b, t) * 0.5;
   let color_a = unpack_color(voxel.color_a);
   let color_b = unpack_color(voxel.color_b);
@@ -119,6 +127,7 @@ fn vs_main(
   out.box_center = center;
   out.box_half = half;
   out.color = color;
+  out.lod_level = chunk.lod_level;
   return out;
 }
 
@@ -132,6 +141,20 @@ fn ray_aabb(ray_origin: vec3<f32>, ray_dir: vec3<f32>, box_min: vec3<f32>, box_m
   let tmin = max(max(tmin_v.x, tmin_v.y), tmin_v.z);
   let tmax = min(min(tmax_v.x, tmax_v.y), tmax_v.z);
   return vec2<f32>(tmin, tmax);
+}
+
+// LOD debug color palette (7 levels)
+fn lod_color(level: u32) -> vec3<f32> {
+  switch level {
+    case 0u: { return vec3<f32>(0.0, 1.0, 0.0); }   // green — finest
+    case 1u: { return vec3<f32>(0.5, 1.0, 0.0); }   // yellow-green
+    case 2u: { return vec3<f32>(1.0, 1.0, 0.0); }   // yellow
+    case 3u: { return vec3<f32>(1.0, 0.5, 0.0); }   // orange
+    case 4u: { return vec3<f32>(1.0, 0.0, 0.0); }   // red
+    case 5u: { return vec3<f32>(1.0, 0.0, 0.5); }   // magenta
+    case 6u: { return vec3<f32>(1.0, 0.0, 1.0); }   // purple — coarsest
+    default: { return vec3<f32>(1.0, 1.0, 1.0); }
+  }
 }
 
 struct FragOutput {
@@ -177,7 +200,13 @@ fn fs_main(in: VertexOutput) -> FragOutput {
   let ndotl = max(dot(normal, light_dir), 0.0);
   let ambient = 0.15;
   let diffuse = 0.85 * ndotl;
-  let lit_color = in.color * (ambient + diffuse);
+  var lit_color = in.color * (ambient + diffuse);
+
+  // LOD debug visualization: blend with LOD palette color when bit 0 set
+  if (uniforms.debug_flags & 1u) != 0u {
+    let lod_col = lod_color(in.lod_level);
+    lit_color = mix(lit_color, lod_col * (ambient + diffuse), 0.6);
+  }
 
   // Project hit point to get depth
   let clip = uniforms.view_proj * vec4<f32>(hit_pos, 1.0);
