@@ -1,12 +1,17 @@
 import type { IVoxelDataSource, RendererOptions } from './types.js';
 import { initWebGPU } from './gpu/context.js';
 import { mat4Create, mat4Multiply, mat4Invert } from './gpu/math.js';
-import { VoxelPool } from './gpu/VoxelPool.js';
+import { VoxelPool, type PoolStats } from './gpu/VoxelPool.js';
 import shaderSource from './shaders/voxel.wgsl?raw';
+import cullSource from './shaders/cull.wgsl?raw';
 
 const UNIFORM_BUFFER_SIZE = 256; // padded to 256-byte alignment
 const CHUNK_UNIFORM_STRIDE = 256; // 256-byte aligned per chunk
-const MAX_CHUNKS = 256;
+const MAX_CHUNKS = 512;
+const CULL_UNIFORM_SIZE = 256; // padded to 256-byte alignment
+const INSTANCE_DATA_STRIDE = 32; // bytes per InstanceData
+const INDIRECT_ARGS_STRIDE = 16; // 4 u32s per drawIndirect call
+const WORKGROUP_SIZE = 256;
 
 export class VoxelRenderer {
   private canvas: HTMLCanvasElement;
@@ -16,7 +21,7 @@ export class VoxelRenderer {
   private format: GPUTextureFormat | null = null;
   private dataSource: IVoxelDataSource | null = null;
 
-  // Pipeline state
+  // Render pipeline state
   private pipeline: GPURenderPipeline | null = null;
   private bindGroupLayout: GPUBindGroupLayout | null = null;
   private chunkBindGroupLayout: GPUBindGroupLayout | null = null;
@@ -28,6 +33,18 @@ export class VoxelRenderer {
   private depthTexture: GPUTexture | null = null;
   private depthTextureView: GPUTextureView | null = null;
 
+  // Compute culling pipeline state
+  private cullPipeline: GPUComputePipeline | null = null;
+  private cullBindGroupLayout: GPUBindGroupLayout | null = null;
+  private cullBindGroup: GPUBindGroup | null = null;
+  private cullUniformBuffer: GPUBuffer | null = null;
+  private visibleIndicesBuffer: GPUBuffer | null = null;
+  private instanceDataBuffer: GPUBuffer | null = null;
+  private indirectArgsBuffer: GPUBuffer | null = null;
+
+  // Staging buffer for clearing indirect args
+  private indirectArgsClearData: ArrayBuffer | null = null;
+
   // Camera / uniform data (CPU-side)
   private uniformData = new ArrayBuffer(UNIFORM_BUFFER_SIZE);
   private uniformFloats = new Float32Array(this.uniformData);
@@ -36,15 +53,29 @@ export class VoxelRenderer {
   private colorInterpolation = 0;
   private debugFlags = 0;
 
+  // Cached view-projection matrix for frustum extraction
+  private viewProjMatrix = new Float32Array(16);
+
+  // Draw call tracking
+  private lastDrawCallCount = 0;
+
   // RTE state
   private cameraPositionHigh: Float64Array | null = null;
 
   // CPU-side chunk uniform staging buffer
   private chunkUniformData = new ArrayBuffer(MAX_CHUNKS * CHUNK_UNIFORM_STRIDE);
+  private chunkUniformView = new DataView(this.chunkUniformData);
+
+  // CPU-side cull uniform staging buffer
+  private cullUniformData = new ArrayBuffer(MAX_CHUNKS * CULL_UNIFORM_SIZE);
+  private cullUniformView = new DataView(this.cullUniformData);
+
+  private maxVoxels: number;
 
   constructor(canvas: HTMLCanvasElement, options?: RendererOptions) {
     this.canvas = canvas;
     this.options = options ?? {};
+    this.maxVoxels = this.options.maxVoxels ?? 2_000_000;
   }
 
   async initialize(): Promise<void> {
@@ -54,8 +85,11 @@ export class VoxelRenderer {
     this.format = format;
 
     const shaderModule = device.createShaderModule({ code: shaderSource });
+    const cullModule = device.createShaderModule({ code: cullSource });
 
-    // Group 0: global uniforms + voxel storage
+    // --- Render pipeline ---
+
+    // Group 0: global uniforms + voxel storage + visible_indices + instance_data
     this.bindGroupLayout = device.createBindGroupLayout({
       entries: [
         {
@@ -65,6 +99,16 @@ export class VoxelRenderer {
         },
         {
           binding: 1,
+          visibility: GPUShaderStage.VERTEX,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.VERTEX,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 3,
           visibility: GPUShaderStage.VERTEX,
           buffer: { type: 'read-only-storage' },
         },
@@ -108,6 +152,52 @@ export class VoxelRenderer {
       },
     });
 
+    // --- Compute cull pipeline ---
+
+    this.cullBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'uniform', hasDynamicOffset: true },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'read-only-storage' },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'storage' },
+        },
+        {
+          binding: 3,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'storage' },
+        },
+        {
+          binding: 4,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: 'storage' },
+        },
+      ],
+    });
+
+    const cullPipelineLayout = device.createPipelineLayout({
+      bindGroupLayouts: [this.cullBindGroupLayout],
+    });
+
+    this.cullPipeline = device.createComputePipeline({
+      layout: cullPipelineLayout,
+      compute: {
+        module: cullModule,
+        entryPoint: 'cull_main',
+      },
+    });
+
+    // --- Buffers ---
+
     this.uniformBuffer = device.createBuffer({
       size: UNIFORM_BUFFER_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -118,18 +208,59 @@ export class VoxelRenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    // Create pool and bind groups
-    this.pool = new VoxelPool(device);
+    this.cullUniformBuffer = device.createBuffer({
+      size: MAX_CHUNKS * CULL_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
 
-    this.bindGroup = device.createBindGroup({
+    this.visibleIndicesBuffer = device.createBuffer({
+      size: this.maxVoxels * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    this.instanceDataBuffer = device.createBuffer({
+      size: this.maxVoxels * INSTANCE_DATA_STRIDE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    this.indirectArgsBuffer = device.createBuffer({
+      size: MAX_CHUNKS * INDIRECT_ARGS_STRIDE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
+    });
+
+    // Pre-allocate clear data for indirect args
+    this.indirectArgsClearData = new ArrayBuffer(MAX_CHUNKS * INDIRECT_ARGS_STRIDE);
+
+    // Create pool
+    this.pool = new VoxelPool(device, this.maxVoxels);
+
+    // Bind groups are created lazily since they depend on the pool buffer
+    this.recreateBindGroups();
+
+    this.createDepthTexture(this.canvas.width, this.canvas.height);
+  }
+
+  private recreateBindGroups(): void {
+    if (
+      !this.device || !this.bindGroupLayout || !this.chunkBindGroupLayout ||
+      !this.cullBindGroupLayout || !this.pool ||
+      !this.uniformBuffer || !this.chunkUniformBuffer || !this.cullUniformBuffer ||
+      !this.visibleIndicesBuffer || !this.instanceDataBuffer || !this.indirectArgsBuffer
+    ) return;
+
+    // Render bind group (group 0)
+    this.bindGroup = this.device.createBindGroup({
       layout: this.bindGroupLayout,
       entries: [
         { binding: 0, resource: { buffer: this.uniformBuffer } },
         { binding: 1, resource: { buffer: this.pool.buffer } },
+        { binding: 2, resource: { buffer: this.visibleIndicesBuffer } },
+        { binding: 3, resource: { buffer: this.instanceDataBuffer } },
       ],
     });
 
-    this.chunkBindGroup = device.createBindGroup({
+    // Render bind group (group 1) — chunk uniforms with dynamic offset
+    this.chunkBindGroup = this.device.createBindGroup({
       layout: this.chunkBindGroupLayout,
       entries: [
         {
@@ -142,7 +273,23 @@ export class VoxelRenderer {
       ],
     });
 
-    this.createDepthTexture(this.canvas.width, this.canvas.height);
+    // Compute cull bind group
+    this.cullBindGroup = this.device.createBindGroup({
+      layout: this.cullBindGroupLayout,
+      entries: [
+        {
+          binding: 0,
+          resource: {
+            buffer: this.cullUniformBuffer,
+            size: CULL_UNIFORM_SIZE,
+          },
+        },
+        { binding: 1, resource: { buffer: this.pool.buffer } },
+        { binding: 2, resource: { buffer: this.visibleIndicesBuffer } },
+        { binding: 3, resource: { buffer: this.instanceDataBuffer } },
+        { binding: 4, resource: { buffer: this.indirectArgsBuffer } },
+      ],
+    });
   }
 
   private createDepthTexture(w: number, h: number): void {
@@ -154,6 +301,68 @@ export class VoxelRenderer {
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
     this.depthTextureView = this.depthTexture.createView();
+  }
+
+  /** Extract 6 frustum planes from a column-major view-projection matrix (Gribb-Hartmann). */
+  private extractFrustumPlanes(vp: Float32Array): Float32Array {
+    // planes: left, right, bottom, top, near, far — each vec4 (nx, ny, nz, d)
+    const planes = new Float32Array(24); // 6 * 4
+
+    // Column-major access: vp[row + col*4]
+    // Left:   row3 + row0
+    planes[0]  = vp[3]  + vp[0];
+    planes[1]  = vp[7]  + vp[4];
+    planes[2]  = vp[11] + vp[8];
+    planes[3]  = vp[15] + vp[12];
+
+    // Right:  row3 - row0
+    planes[4]  = vp[3]  - vp[0];
+    planes[5]  = vp[7]  - vp[4];
+    planes[6]  = vp[11] - vp[8];
+    planes[7]  = vp[15] - vp[12];
+
+    // Bottom: row3 + row1
+    planes[8]  = vp[3]  + vp[1];
+    planes[9]  = vp[7]  + vp[5];
+    planes[10] = vp[11] + vp[9];
+    planes[11] = vp[15] + vp[13];
+
+    // Top:    row3 - row1
+    planes[12] = vp[3]  - vp[1];
+    planes[13] = vp[7]  - vp[5];
+    planes[14] = vp[11] - vp[9];
+    planes[15] = vp[15] - vp[13];
+
+    // Near (WebGPU [0,1] depth): row2
+    planes[16] = vp[2];
+    planes[17] = vp[6];
+    planes[18] = vp[10];
+    planes[19] = vp[14];
+
+    // Far:    row3 - row2
+    planes[20] = vp[3]  - vp[2];
+    planes[21] = vp[7]  - vp[6];
+    planes[22] = vp[11] - vp[10];
+    planes[23] = vp[15] - vp[14];
+
+    // Normalize all 6 planes
+    for (let i = 0; i < 6; i++) {
+      const base = i * 4;
+      const len = Math.sqrt(
+        planes[base] * planes[base] +
+        planes[base + 1] * planes[base + 1] +
+        planes[base + 2] * planes[base + 2],
+      );
+      if (len > 0) {
+        const invLen = 1 / len;
+        planes[base] *= invLen;
+        planes[base + 1] *= invLen;
+        planes[base + 2] *= invLen;
+        planes[base + 3] *= invLen;
+      }
+    }
+
+    return planes;
   }
 
   /** Backward-compatible convenience: loads data as the '__default' chunk. */
@@ -170,6 +379,7 @@ export class VoxelRenderer {
   ): void {
     if (!this.pool) return;
     this.pool.loadChunk(id, data, count, worldOrigin, lodLevel);
+    this.recreateBindGroups();
   }
 
   unloadChunk(id: string): void {
@@ -205,6 +415,14 @@ export class VoxelRenderer {
     return this.debugFlags;
   }
 
+  get drawCallCount(): number {
+    return this.lastDrawCallCount;
+  }
+
+  getPoolStats(): PoolStats | null {
+    return this.pool?.getStats() ?? null;
+  }
+
   updateCamera(
     viewMatrix: Float32Array,
     projectionMatrix: Float32Array,
@@ -214,11 +432,7 @@ export class VoxelRenderer {
     let rteView: Float32Array;
     if (positionHigh) {
       this.cameraPositionHigh = positionHigh;
-      // Copy view matrix and zero translation (column 3, indices 12-14)
       rteView = new Float32Array(viewMatrix);
-      // For a look-at view matrix, the translation is encoded in column 3.
-      // We need to recompute: strip the eye-space translation so camera is at origin.
-      // view = R * T(-eye). To get just R, we zero the translation part.
       rteView[12] = 0;
       rteView[13] = 0;
       rteView[14] = 0;
@@ -229,6 +443,9 @@ export class VoxelRenderer {
 
     const viewProj = mat4Create();
     mat4Multiply(viewProj, projectionMatrix, rteView);
+
+    // Cache VP matrix for frustum extraction
+    this.viewProjMatrix.set(viewProj);
 
     const invViewProj = mat4Create();
     mat4Invert(invViewProj, viewProj);
@@ -242,12 +459,10 @@ export class VoxelRenderer {
     f.set(invViewProj, 16);
     // camera_pos: offset 32 (3 floats)
     if (positionHigh) {
-      // RTE: camera at origin
       f[32] = 0;
       f[33] = 0;
       f[34] = 0;
     } else {
-      // Extract camera position from inverse view matrix
       const invView = mat4Create();
       mat4Invert(invView, viewMatrix);
       f[32] = invView[12];
@@ -262,7 +477,7 @@ export class VoxelRenderer {
     // near: offset 38
     f[38] = 0.1;
     // far: offset 39
-    f[39] = 1000.0;
+    f[39] = 10000.0;
     // color_t: offset 40
     f[40] = this.colorInterpolation;
     // debug_flags: offset 41 (u32)
@@ -271,37 +486,114 @@ export class VoxelRenderer {
 
   render(): void {
     if (
-      !this.device || !this.context || !this.pipeline ||
-      !this.bindGroup || !this.chunkBindGroup ||
-      !this.depthTextureView || !this.pool || !this.chunkUniformBuffer
+      !this.device || !this.context || !this.pipeline || !this.cullPipeline ||
+      !this.bindGroup || !this.chunkBindGroup || !this.cullBindGroup ||
+      !this.depthTextureView || !this.pool || !this.chunkUniformBuffer ||
+      !this.cullUniformBuffer || !this.indirectArgsBuffer || !this.indirectArgsClearData
     ) return;
 
-    // Write global uniforms
-    this.device.queue.writeBuffer(this.uniformBuffer!, 0, this.uniformData);
+    const device = this.device;
 
-    // Write per-chunk uniforms
+    // Write global uniforms
+    device.queue.writeBuffer(this.uniformBuffer!, 0, this.uniformData);
+
+    // Extract frustum planes from cached VP matrix
+    const frustumPlanes = this.extractFrustumPlanes(this.viewProjMatrix);
+
+    // Write per-chunk uniforms (render) + cull uniforms (compute)
     const camHigh = this.cameraPositionHigh;
+    const dv = this.chunkUniformView;
+    const cullDv = this.cullUniformView;
+    const clearData = new DataView(this.indirectArgsClearData);
+
+    let chunkIndex = 0;
     this.pool.forEachChunk((_first, _count, chunkInfo) => {
       const byteOffset = chunkInfo.chunkIndex * CHUNK_UNIFORM_STRIDE;
-      const view = new Float32Array(this.chunkUniformData, byteOffset, 4);
+
+      // Compute RTE offset for this chunk
+      let rteX: number, rteY: number, rteZ: number;
       if (camHigh) {
-        // RTE offset: float32(chunk_origin - camera_pos)
-        view[0] = Number(chunkInfo.worldOrigin[0] - camHigh[0]);
-        view[1] = Number(chunkInfo.worldOrigin[1] - camHigh[1]);
-        view[2] = Number(chunkInfo.worldOrigin[2] - camHigh[2]);
+        rteX = Number(chunkInfo.worldOrigin[0] - camHigh[0]);
+        rteY = Number(chunkInfo.worldOrigin[1] - camHigh[1]);
+        rteZ = Number(chunkInfo.worldOrigin[2] - camHigh[2]);
       } else {
-        // No RTE: offset is just the world origin
-        view[0] = Number(chunkInfo.worldOrigin[0]);
-        view[1] = Number(chunkInfo.worldOrigin[1]);
-        view[2] = Number(chunkInfo.worldOrigin[2]);
+        rteX = Number(chunkInfo.worldOrigin[0]);
+        rteY = Number(chunkInfo.worldOrigin[1]);
+        rteZ = Number(chunkInfo.worldOrigin[2]);
       }
-      const u32view = new Uint32Array(this.chunkUniformData, byteOffset + 12, 1);
-      u32view[0] = chunkInfo.lodLevel;
+
+      // Render chunk uniforms
+      dv.setFloat32(byteOffset, rteX, true);
+      dv.setFloat32(byteOffset + 4, rteY, true);
+      dv.setFloat32(byteOffset + 8, rteZ, true);
+      dv.setUint32(byteOffset + 12, chunkInfo.lodLevel, true);
+
+      // Cull uniforms for this chunk (256-byte aligned)
+      const cullOffset = chunkInfo.chunkIndex * CULL_UNIFORM_SIZE;
+
+      // view_proj: 64 bytes (16 floats)
+      for (let i = 0; i < 16; i++) {
+        cullDv.setFloat32(cullOffset + i * 4, this.viewProjMatrix[i], true);
+      }
+
+      // frustum_planes: 6 * vec4 = 96 bytes at offset 64
+      for (let i = 0; i < 24; i++) {
+        cullDv.setFloat32(cullOffset + 64 + i * 4, frustumPlanes[i], true);
+      }
+
+      // viewport_size: vec2 at offset 160
+      cullDv.setFloat32(cullOffset + 160, this.canvas.width, true);
+      cullDv.setFloat32(cullOffset + 164, this.canvas.height, true);
+
+      // interpolation: f32 at offset 168
+      cullDv.setFloat32(cullOffset + 168, this.interpolation, true);
+
+      // voxel_count: u32 at offset 172
+      cullDv.setUint32(cullOffset + 172, chunkInfo.voxelCount, true);
+
+      // rte_offset: vec3 at offset 176
+      cullDv.setFloat32(cullOffset + 176, rteX, true);
+      cullDv.setFloat32(cullOffset + 180, rteY, true);
+      cullDv.setFloat32(cullOffset + 184, rteZ, true);
+
+      // lod_level: u32 at offset 188
+      cullDv.setUint32(cullOffset + 188, chunkInfo.lodLevel, true);
+
+      // start_slot: u32 at offset 192
+      cullDv.setUint32(cullOffset + 192, chunkInfo.startSlot, true);
+
+      // chunk_index: u32 at offset 196
+      cullDv.setUint32(cullOffset + 196, chunkInfo.chunkIndex, true);
+
+      // Clear indirect args for this chunk: vertex_count=6, instance_count=0, first_vertex=0, first_instance=start_slot
+      const argsOffset = chunkInfo.chunkIndex * INDIRECT_ARGS_STRIDE;
+      clearData.setUint32(argsOffset, 6, true);       // vertex_count
+      clearData.setUint32(argsOffset + 4, 0, true);   // instance_count (atomicAdd starts from 0)
+      clearData.setUint32(argsOffset + 8, 0, true);   // first_vertex
+      clearData.setUint32(argsOffset + 12, chunkInfo.startSlot, true); // first_instance
+
+      chunkIndex++;
     });
 
-    this.device.queue.writeBuffer(this.chunkUniformBuffer, 0, this.chunkUniformData);
+    device.queue.writeBuffer(this.chunkUniformBuffer!, 0, this.chunkUniformData);
+    device.queue.writeBuffer(this.cullUniformBuffer!, 0, this.cullUniformData);
+    device.queue.writeBuffer(this.indirectArgsBuffer, 0, this.indirectArgsClearData);
 
-    const encoder = this.device.createCommandEncoder();
+    const encoder = device.createCommandEncoder();
+
+    // --- Compute pass: frustum culling ---
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(this.cullPipeline);
+
+    this.pool.forEachChunk((_first, _count, chunkInfo) => {
+      computePass.setBindGroup(0, this.cullBindGroup!, [chunkInfo.chunkIndex * CULL_UNIFORM_SIZE]);
+      const workgroups = Math.ceil(chunkInfo.voxelCount / WORKGROUP_SIZE);
+      computePass.dispatchWorkgroups(workgroups);
+    });
+
+    computePass.end();
+
+    // --- Render pass ---
     const textureView = this.context.getCurrentTexture().createView();
 
     const pass = encoder.beginRenderPass({
@@ -324,14 +616,17 @@ export class VoxelRenderer {
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
 
-    this.pool.forEachChunk((firstInstance, instanceCount, chunkInfo) => {
+    let drawCalls = 0;
+    this.pool.forEachChunk((_first, _count, chunkInfo) => {
       pass.setBindGroup(1, this.chunkBindGroup!, [chunkInfo.chunkIndex * CHUNK_UNIFORM_STRIDE]);
-      pass.draw(6, instanceCount, 0, firstInstance);
+      pass.drawIndirect(this.indirectArgsBuffer!, chunkInfo.chunkIndex * INDIRECT_ARGS_STRIDE);
+      drawCalls++;
     });
+    this.lastDrawCallCount = drawCalls;
 
     pass.end();
 
-    this.device.queue.submit([encoder.finish()]);
+    device.queue.submit([encoder.finish()]);
   }
 
   resize(width: number, height: number): void {
@@ -345,16 +640,28 @@ export class VoxelRenderer {
     this.pool?.dispose();
     this.uniformBuffer?.destroy();
     this.chunkUniformBuffer?.destroy();
+    this.cullUniformBuffer?.destroy();
+    this.visibleIndicesBuffer?.destroy();
+    this.instanceDataBuffer?.destroy();
+    this.indirectArgsBuffer?.destroy();
     this.depthTexture = null;
     this.depthTextureView = null;
     this.pool = null;
     this.uniformBuffer = null;
     this.chunkUniformBuffer = null;
+    this.cullUniformBuffer = null;
+    this.visibleIndicesBuffer = null;
+    this.instanceDataBuffer = null;
+    this.indirectArgsBuffer = null;
+    this.indirectArgsClearData = null;
     this.pipeline = null;
     this.bindGroup = null;
     this.chunkBindGroup = null;
+    this.cullBindGroup = null;
     this.bindGroupLayout = null;
     this.chunkBindGroupLayout = null;
+    this.cullBindGroupLayout = null;
+    this.cullPipeline = null;
     this.context?.unconfigure();
     this.device?.destroy();
     this.device = null;

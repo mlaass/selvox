@@ -1,4 +1,4 @@
-// Phase 1–3 — Interpolated voxel cubes with RTE coordinates and LOD debug
+// Render shader — reads precomputed instance data from compute culling pass
 
 struct Uniforms {
   view_proj:      mat4x4<f32>,   // 0
@@ -32,8 +32,18 @@ struct VoxelBuffer {
   voxels: array<Voxel>,
 };
 
+struct InstanceData {
+  ndc_min:   vec2<f32>,  // 0
+  ndc_max:   vec2<f32>,  // 8
+  min_depth: f32,        // 16
+  lod_level: u32,        // 20
+  _pad:      vec2<f32>,  // 24
+};
+
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> voxel_buf: VoxelBuffer;
+@group(0) @binding(2) var<storage, read> visible_indices: array<u32>;
+@group(0) @binding(3) var<storage, read> instance_data: array<InstanceData>;
 @group(1) @binding(0) var<uniform> chunk: ChunkUniforms;
 
 struct VertexOutput {
@@ -59,45 +69,26 @@ fn vs_main(
   @builtin(vertex_index) vid: u32,
   @builtin(instance_index) iid: u32,
 ) -> VertexOutput {
-  let voxel = voxel_buf.voxels[iid];
+  // Read precomputed instance data from compute cull pass
+  let inst = instance_data[iid];
+  let voxel_index = visible_indices[iid];
+  let voxel = voxel_buf.voxels[voxel_index];
   let t = uniforms.interpolation;
 
-  // Interpolate position, size, color — apply RTE offset
+  // Reconstruct center/half/color for fragment shader ray-AABB
   let center = mix(voxel.pos_a.xyz, voxel.pos_b.xyz, t) + chunk.rte_offset;
   let half_size = mix(voxel.size_a, voxel.size_b, t) * 0.5;
   let color_a = unpack_color(voxel.color_a);
   let color_b = unpack_color(voxel.color_b);
   let color = mix(color_a, color_b, uniforms.color_t);
-
   let half = vec3<f32>(half_size, half_size, half_size);
 
-  // Project 8 box corners to find screen-space AABB
-  var ndc_min = vec2<f32>(1e9, 1e9);
-  var ndc_max = vec2<f32>(-1e9, -1e9);
-
-  for (var i = 0u; i < 8u; i = i + 1u) {
-    let corner = center + half * vec3<f32>(
-      select(-1.0, 1.0, (i & 1u) != 0u),
-      select(-1.0, 1.0, (i & 2u) != 0u),
-      select(-1.0, 1.0, (i & 4u) != 0u),
-    );
-    let clip = uniforms.view_proj * vec4<f32>(corner, 1.0);
-    let ndc = clip.xy / clip.w;
-    ndc_min = min(ndc_min, ndc);
-    ndc_max = max(ndc_max, ndc);
-  }
-
-  // Pad slightly to avoid clipping at edges
-  let pad = vec2<f32>(2.0 / uniforms.viewport_size.x, 2.0 / uniforms.viewport_size.y);
-  ndc_min = ndc_min - pad;
-  ndc_max = ndc_max + pad;
-
-  // Clamp to clip space
-  ndc_min = clamp(ndc_min, vec2<f32>(-1.0), vec2<f32>(1.0));
-  ndc_max = clamp(ndc_max, vec2<f32>(-1.0), vec2<f32>(1.0));
+  // Read precomputed screen-space AABB
+  let ndc_min = inst.ndc_min;
+  let ndc_max = inst.ndc_max;
+  let min_depth = inst.min_depth;
 
   // 6 vertices → 2 triangles forming the quad
-  // Triangle 1: 0,1,2  Triangle 2: 2,1,3
   var quad_uv: vec2<f32>;
   switch vid % 6u {
     case 0u: { quad_uv = vec2<f32>(0.0, 0.0); }
@@ -121,13 +112,13 @@ fn vs_main(
   let ray_dir = normalize(p_far - p_near);
 
   var out: VertexOutput;
-  out.position = vec4<f32>(ndc_pos, 0.0, 1.0);
+  out.position = vec4<f32>(ndc_pos, min_depth, 1.0);
   out.ray_origin = uniforms.camera_pos;
   out.ray_dir = ray_dir;
   out.box_center = center;
   out.box_half = half;
   out.color = color;
-  out.lod_level = chunk.lod_level;
+  out.lod_level = inst.lod_level;
   return out;
 }
 
@@ -159,7 +150,6 @@ fn lod_color(level: u32) -> vec3<f32> {
 
 struct FragOutput {
   @location(0) color: vec4<f32>,
-  @builtin(frag_depth) depth: f32,
 };
 
 @fragment
@@ -208,12 +198,7 @@ fn fs_main(in: VertexOutput) -> FragOutput {
     lit_color = mix(lit_color, lod_col * (ambient + diffuse), 0.6);
   }
 
-  // Project hit point to get depth
-  let clip = uniforms.view_proj * vec4<f32>(hit_pos, 1.0);
-  let depth = clip.z / clip.w;
-
   var out: FragOutput;
   out.color = vec4<f32>(lit_color, 1.0);
-  out.depth = depth;
   return out;
 }

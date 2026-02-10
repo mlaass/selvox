@@ -1,5 +1,91 @@
-import { VoxelRenderer, PerformanceOverlay, MockOctreeSource, ChunkManager } from '../src/index.js';
-import { mat4Create, mat4Perspective, mat4LookAt } from '../src/gpu/math.js';
+import { VoxelRenderer, PerformanceOverlay, OverlayMode, PerlinNoise, FlyCamera } from '../src/index.js';
+import { mat4Create, mat4Perspective } from '../src/gpu/math.js';
+
+const VOXEL_STRIDE = 64; // bytes per voxel
+const GRID_SIZE = 200;
+const SURFACE_DEPTH = 25;
+const VOXEL_SIZE = 1.0;
+
+function generateTerrain(): { data: ArrayBuffer; count: number } {
+  const noise = new PerlinNoise(42);
+  const fbmOpts = { frequency: 0.01, octaves: 6 };
+  const heightScale = 40;
+  const halfGrid = GRID_SIZE / 2;
+
+  // First pass: count voxels
+  let count = 0;
+  for (let x = 0; x < GRID_SIZE; x++) {
+    for (let z = 0; z < GRID_SIZE; z++) {
+      const wx = x - halfGrid;
+      const wz = z - halfGrid;
+      const h = Math.floor(noise.fbm2D(wx, wz, fbmOpts) * heightScale);
+      for (let dy = 0; dy < SURFACE_DEPTH; dy++) {
+        const wy = h - dy;
+        if (wy >= -heightScale) {
+          count++;
+        }
+      }
+    }
+  }
+
+  // Second pass: fill buffer
+  const data = new ArrayBuffer(count * VOXEL_STRIDE);
+  const view = new DataView(data);
+  let offset = 0;
+
+  for (let x = 0; x < GRID_SIZE; x++) {
+    for (let z = 0; z < GRID_SIZE; z++) {
+      const wx = x - halfGrid;
+      const wz = z - halfGrid;
+      const h = Math.floor(noise.fbm2D(wx, wz, fbmOpts) * heightScale);
+      for (let dy = 0; dy < SURFACE_DEPTH; dy++) {
+        const wy = h - dy;
+        if (wy < -heightScale) continue;
+
+        // Color: green top, brown below
+        const isTop = dy === 0;
+        const r = isTop ? 60 : 120;
+        const g = isTop ? 160 : 80;
+        const b = isTop ? 40 : 40;
+        const packedColor = r | (g << 8) | (b << 16) | (255 << 24);
+
+        const px = wx * VOXEL_SIZE;
+        const py = wy * VOXEL_SIZE;
+        const pz = wz * VOXEL_SIZE;
+
+        // pos_a (vec4 = 16 bytes)
+        view.setFloat32(offset, px, true);
+        view.setFloat32(offset + 4, py, true);
+        view.setFloat32(offset + 8, pz, true);
+        view.setFloat32(offset + 12, 0, true);
+        // color_a (u32)
+        view.setUint32(offset + 16, packedColor, true);
+        // size_a (f32)
+        view.setFloat32(offset + 20, VOXEL_SIZE, true);
+        // _pad0
+        view.setFloat32(offset + 24, 0, true);
+        view.setFloat32(offset + 28, 0, true);
+        // pos_b = pos_a
+        view.setFloat32(offset + 32, px, true);
+        view.setFloat32(offset + 36, py, true);
+        view.setFloat32(offset + 40, pz, true);
+        view.setFloat32(offset + 44, 0, true);
+        // color_b = color_a
+        view.setUint32(offset + 48, packedColor, true);
+        // size_b = size_a
+        view.setFloat32(offset + 52, VOXEL_SIZE, true);
+        // _pad1
+        view.setFloat32(offset + 56, 0, true);
+        view.setFloat32(offset + 60, 0, true);
+
+        offset += VOXEL_STRIDE;
+      }
+    }
+  }
+
+  console.log(`selvox: generated ${count} voxels (${GRID_SIZE}x${GRID_SIZE}, depth ${SURFACE_DEPTH})`);
+  return { data, count };
+}
 
 async function main() {
   const canvas = document.getElementById('gpu-canvas') as HTMLCanvasElement;
@@ -11,7 +97,7 @@ async function main() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
 
-  const renderer = new VoxelRenderer(canvas);
+  const renderer = new VoxelRenderer(canvas, { maxVoxels: 2_000_000 });
 
   try {
     await renderer.initialize();
@@ -25,53 +111,49 @@ async function main() {
     return;
   }
 
-  // Set up mock octree data source and chunk manager
-  const source = new MockOctreeSource(3); // 3x3x3 grid of chunk positions
-  const metadata = await source.getMetadata();
-  renderer.setDataSource(source);
+  // Generate and upload terrain in one shot
+  const { data, count } = generateTerrain();
+  renderer.loadChunk('terrain', data, count, new Float64Array([0, 0, 0]), 0);
 
-  const chunkManager = new ChunkManager(renderer, source);
-  await chunkManager.initialize();
-
-  // World center from metadata (large geospatial offset)
-  const worldCenter = new Float64Array([
-    (metadata.worldBounds[0] + metadata.worldBounds[3]) * 0.5,
-    (metadata.worldBounds[1] + metadata.worldBounds[4]) * 0.5,
-    (metadata.worldBounds[2] + metadata.worldBounds[5]) * 0.5,
-  ]);
-
-  console.log(`selvox: World center at [${worldCenter[0]}, ${worldCenter[1]}, ${worldCenter[2]}] (RTE mode)`);
+  // Flying camera — start above terrain looking slightly down
+  const camera = new FlyCamera({
+    position: new Float64Array([0, 60, 0]),
+    yaw: 0,
+    pitch: -0.3,
+    speed: 20,
+  });
+  camera.attach(canvas);
 
   // Performance overlay
   const overlay = new PerformanceOverlay(canvas);
   let lastTimeMs = -1;
 
-  // Info overlay for chunk/LOD stats
+  // Info overlay
   const infoDiv = document.createElement('div');
-  infoDiv.style.cssText = 'position:fixed;bottom:8px;left:8px;color:#ccc;font:12px monospace;background:rgba(0,0,0,0.65);padding:4px 8px;border-radius:4px;pointer-events:none;z-index:9999';
+  infoDiv.style.cssText = 'position:fixed;bottom:8px;left:8px;color:#ccc;font:12px monospace;background:rgba(0,0,0,0.65);padding:4px 8px;border-radius:4px;pointer-events:none;z-index:9999;white-space:pre';
   document.body.appendChild(infoDiv);
 
+  // Projection matrix
+  const proj = mat4Create();
+
+  // Diagnostic logging state
+  let lastDiagnosticTime = 0;
+
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'd' || e.key === 'D') overlay.cycle();
+    if (e.key === 'p' || e.key === 'P') overlay.cycle();
     if (e.key === 'l' || e.key === 'L') {
       renderer.setDebugFlags(renderer.currentDebugFlags ^ 1);
       console.log(`selvox: LOD debug ${(renderer.currentDebugFlags & 1) ? 'ON' : 'OFF'}`);
     }
-    if (e.key === 'r' || e.key === 'R') {
-      chunkManager.unloadAll();
-      console.log('selvox: force-reloaded all chunks');
+    if (e.key === '=' || e.key === '+') {
+      camera.setSpeed(camera.getSpeed() * 1.5);
+      console.log(`selvox: speed = ${camera.getSpeed().toFixed(1)}`);
+    }
+    if (e.key === '-' || e.key === '_') {
+      camera.setSpeed(camera.getSpeed() / 1.5);
+      console.log(`selvox: speed = ${camera.getSpeed().toFixed(1)}`);
     }
   });
-
-  // Camera setup — orbit around world center
-  const view = mat4Create();
-  const proj = mat4Create();
-  // eye/center/up in RTE-local coordinates (relative to camera)
-  const eyeLocal = new Float32Array(3);
-  const centerLocal = new Float32Array([0, 0, 0]);
-  const up = new Float32Array([0, 1, 0]);
-  // High-precision camera position
-  const cameraPositionHigh = new Float64Array(3);
 
   window.addEventListener('resize', () => {
     renderer.resize(window.innerWidth, window.innerHeight);
@@ -81,47 +163,62 @@ async function main() {
   let infoUpdateCounter = 0;
 
   function frame(timeMs: number) {
-    const t = timeMs * 0.001;
+    const dt = lastTimeMs < 0 ? 0 : (timeMs - lastTimeMs) * 0.001;
+    lastTimeMs = timeMs;
 
-    // Orbiting camera at large world offset
-    const radius = 20;
-    const angle = t * 0.4;
-    const camHeight = 8;
+    // Update camera
+    camera.update(dt);
 
-    // Camera position in world (double precision)
-    cameraPositionHigh[0] = worldCenter[0] + Math.cos(angle) * radius;
-    cameraPositionHigh[1] = worldCenter[1] + camHeight;
-    cameraPositionHigh[2] = worldCenter[2] + Math.sin(angle) * radius;
+    const camPos = camera.getPosition();
+    const viewMat = camera.getViewMatrix();
 
-    // In RTE space, eye is at the orbit offset from origin
-    // The RTE offset per-chunk will shift chunks relative to camera
-    eyeLocal[0] = Math.cos(angle) * radius;
-    eyeLocal[1] = camHeight;
-    eyeLocal[2] = Math.sin(angle) * radius;
-
+    // Projection
     const aspect = canvas.width / canvas.height;
-    mat4Perspective(proj, Math.PI / 4, aspect, 0.1, 1000);
-    mat4LookAt(view, eyeLocal, centerLocal, up);
+    mat4Perspective(proj, Math.PI / 4, aspect, 0.1, 10000);
 
-    // Update chunks based on camera position
-    chunkManager.update(cameraPositionHigh);
-
-    // No interpolation animation for octree demo
+    // Render
     renderer.setTime(0);
     renderer.setColorTime(0);
-
-    renderer.updateCamera(view, proj, cameraPositionHigh);
+    renderer.updateCamera(viewMat, proj, camPos);
     renderer.render();
 
-    const frameDeltaMs = lastTimeMs < 0 ? 0 : timeMs - lastTimeMs;
-    lastTimeMs = timeMs;
+    // Perf overlay
+    const frameDeltaMs = dt * 1000;
     overlay.update({ frameDeltaMs, voxelCount: renderer.voxelCount });
 
-    // Update info overlay at lower frequency
+    // Info overlay (every 30 frames)
     infoUpdateCounter++;
     if (infoUpdateCounter % 30 === 0) {
-      const lodLevels = Array.from(chunkManager.getActiveLodLevels()).sort();
-      infoDiv.textContent = `Chunks: ${renderer.chunkCount} | LODs: [${lodLevels.join(',')}] | [D]perf [L]LOD [R]reload`;
+      const pos = camPos;
+      infoDiv.textContent =
+        `Voxels: ${renderer.voxelCount} | Draw calls: ${renderer.drawCallCount}\n` +
+        `Pos: [${pos[0].toFixed(1)}, ${pos[1].toFixed(1)}, ${pos[2].toFixed(1)}]\n` +
+        `Speed: ${camera.getSpeed().toFixed(1)}\n` +
+        `[WASD]fly [Mouse]look [Space/Ctrl]up/down [Shift]fast\n` +
+        `[P]perf [L]LOD [+/-]speed`;
+    }
+
+    // Diagnostic logging — every 2s when overlay is Expanded
+    if (overlay.getMode() === OverlayMode.Expanded && timeMs - lastDiagnosticTime > 2000) {
+      lastDiagnosticTime = timeMs;
+      const fps = dt > 0 ? (1000 / (dt * 1000)).toFixed(0) : '?';
+      const frameTimeStr = (dt * 1000).toFixed(1);
+      const stats = renderer.getPoolStats();
+      if (stats) {
+        let msg = `[selvox diagnostic]\n`;
+        msg += `  FPS: ${fps} | Frame: ${frameTimeStr}ms\n`;
+        msg += `  Draw calls: ${renderer.drawCallCount}\n`;
+        msg += `  Total voxels: ${stats.totalVoxels}\n`;
+        msg += `  Buffer: ${stats.bufferUsedSlots}/${stats.bufferCapacity} (${(stats.bufferUtilization * 100).toFixed(1)}%)\n`;
+        msg += `  Chunks: ${stats.chunkCount}\n`;
+        if (stats.perLod.size > 0) {
+          msg += `  Per-LOD:\n`;
+          for (const [lod, info] of [...stats.perLod.entries()].sort((a, b) => a[0] - b[0])) {
+            msg += `    LOD ${lod}: ${info.chunkCount} chunks, ${info.voxelCount} voxels\n`;
+          }
+        }
+        console.log(msg);
+      }
     }
 
     requestAnimationFrame(frame);

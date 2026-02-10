@@ -3,6 +3,15 @@ import { BlockAllocator } from './BlockAllocator.js';
 const VOXEL_STRIDE = 64; // bytes per voxel
 const DEFAULT_MAX_VOXELS = 1_000_000;
 
+export interface PoolStats {
+  totalVoxels: number;
+  chunkCount: number;
+  bufferUsedSlots: number;
+  bufferCapacity: number;
+  bufferUtilization: number;
+  perLod: Map<number, { chunkCount: number; voxelCount: number }>;
+}
+
 export interface PoolChunkInfo {
   startSlot: number;
   voxelCount: number;
@@ -109,6 +118,31 @@ export class VoxelPool {
     for (const info of this.chunks.values()) {
       cb(info.startSlot, info.voxelCount, info);
     }
+  }
+
+  getStats(): PoolStats {
+    const perLod = new Map<number, { chunkCount: number; voxelCount: number }>();
+    let totalVoxels = 0;
+    for (const info of this.chunks.values()) {
+      totalVoxels += info.voxelCount;
+      const entry = perLod.get(info.lodLevel);
+      if (entry) {
+        entry.chunkCount++;
+        entry.voxelCount += info.voxelCount;
+      } else {
+        perLod.set(info.lodLevel, { chunkCount: 1, voxelCount: info.voxelCount });
+      }
+    }
+    const bufferUsedSlots = this.allocator.used;
+    const bufferCapacity = this.allocator.capacity;
+    return {
+      totalVoxels,
+      chunkCount: this.chunks.size,
+      bufferUsedSlots,
+      bufferCapacity,
+      bufferUtilization: bufferCapacity > 0 ? bufferUsedSlots / bufferCapacity : 0,
+      perLod,
+    };
   }
 
   dispose(): void {

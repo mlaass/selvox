@@ -5,6 +5,8 @@ export interface RendererOptions {
   powerPreference?: GPUPowerPreference;
   /** Preferred canvas texture format. If omitted, uses navigator.gpu.getPreferredCanvasFormat() */
   preferredFormat?: GPUTextureFormat;
+  /** Maximum number of voxels in the GPU pool. Default: 2_000_000 */
+  maxVoxels?: number;
 }
 
 export interface VoxelDataChunk {
