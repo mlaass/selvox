@@ -1,6 +1,7 @@
 import type { IVoxelDataSource, RendererOptions } from './types.js';
 import { initWebGPU } from './gpu/context.js';
 import { mat4Create, mat4Multiply, mat4Invert } from './gpu/math.js';
+import { VoxelPool } from './gpu/VoxelPool.js';
 import shaderSource from './shaders/voxel.wgsl?raw';
 
 const UNIFORM_BUFFER_SIZE = 256; // padded to 256-byte alignment
@@ -18,8 +19,7 @@ export class VoxelRenderer {
   private bindGroupLayout: GPUBindGroupLayout | null = null;
   private bindGroup: GPUBindGroup | null = null;
   private uniformBuffer: GPUBuffer | null = null;
-  private voxelStorageBuffer: GPUBuffer | null = null;
-  private instanceCount = 0;
+  private pool: VoxelPool | null = null;
   private depthTexture: GPUTexture | null = null;
   private depthTextureView: GPUTextureView | null = null;
 
@@ -27,6 +27,7 @@ export class VoxelRenderer {
   private uniformData = new ArrayBuffer(UNIFORM_BUFFER_SIZE);
   private uniformFloats = new Float32Array(this.uniformData);
   private interpolation = 0;
+  private colorInterpolation = 0;
 
   constructor(canvas: HTMLCanvasElement, options?: RendererOptions) {
     this.canvas = canvas;
@@ -87,6 +88,17 @@ export class VoxelRenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
+    // Create pool and bind group once
+    this.pool = new VoxelPool(device);
+
+    this.bindGroup = device.createBindGroup({
+      layout: this.bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: { buffer: this.pool.buffer } },
+      ],
+    });
+
     this.createDepthTexture(this.canvas.width, this.canvas.height);
   }
 
@@ -101,32 +113,31 @@ export class VoxelRenderer {
     this.depthTextureView = this.depthTexture.createView();
   }
 
+  /** Backward-compatible convenience: loads data as the '__default' chunk. */
   uploadVoxels(data: ArrayBuffer, count: number): void {
-    if (!this.device || !this.bindGroupLayout || !this.uniformBuffer) return;
+    this.loadChunk('__default', data, count);
+  }
 
-    this.voxelStorageBuffer?.destroy();
+  loadChunk(id: string, data: ArrayBuffer, count: number): void {
+    if (!this.pool) return;
+    this.pool.loadChunk(id, data, count);
+  }
 
-    this.voxelStorageBuffer = this.device.createBuffer({
-      size: Math.max(64, data.byteLength),
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      mappedAtCreation: true,
-    });
-    new Uint8Array(this.voxelStorageBuffer.getMappedRange()).set(new Uint8Array(data));
-    this.voxelStorageBuffer.unmap();
+  unloadChunk(id: string): void {
+    if (!this.pool) return;
+    this.pool.unloadChunk(id);
+  }
 
-    this.instanceCount = count;
-
-    this.bindGroup = this.device.createBindGroup({
-      layout: this.bindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: { buffer: this.voxelStorageBuffer } },
-      ],
-    });
+  get voxelCount(): number {
+    return this.pool?.totalVoxels ?? 0;
   }
 
   setTime(t: number): void {
     this.interpolation = t;
+  }
+
+  setColorTime(t: number): void {
+    this.colorInterpolation = t;
   }
 
   setDataSource(adapter: IVoxelDataSource): void {
@@ -163,10 +174,12 @@ export class VoxelRenderer {
     f[38] = 0.1;
     // far: offset 39
     f[39] = 1000.0;
+    // color_t: offset 40
+    f[40] = this.colorInterpolation;
   }
 
   render(): void {
-    if (!this.device || !this.context || !this.pipeline || !this.bindGroup || !this.depthTextureView) return;
+    if (!this.device || !this.context || !this.pipeline || !this.bindGroup || !this.depthTextureView || !this.pool) return;
 
     this.device.queue.writeBuffer(this.uniformBuffer!, 0, this.uniformData);
 
@@ -192,7 +205,11 @@ export class VoxelRenderer {
 
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
-    pass.draw(6, this.instanceCount);
+
+    this.pool.forEachChunk((firstInstance, instanceCount) => {
+      pass.draw(6, instanceCount, 0, firstInstance);
+    });
+
     pass.end();
 
     this.device.queue.submit([encoder.finish()]);
@@ -206,16 +223,15 @@ export class VoxelRenderer {
 
   dispose(): void {
     this.depthTexture?.destroy();
-    this.voxelStorageBuffer?.destroy();
+    this.pool?.dispose();
     this.uniformBuffer?.destroy();
     this.depthTexture = null;
     this.depthTextureView = null;
-    this.voxelStorageBuffer = null;
+    this.pool = null;
     this.uniformBuffer = null;
     this.pipeline = null;
     this.bindGroup = null;
     this.bindGroupLayout = null;
-    this.instanceCount = 0;
     this.context?.unconfigure();
     this.device?.destroy();
     this.device = null;

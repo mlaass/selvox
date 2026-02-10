@@ -8,6 +8,7 @@ struct Uniforms {
   viewport_size:  vec2<f32>,     // 144
   near:           f32,           // 152
   far:            f32,           // 156
+  color_t:        f32,           // 160
 };
 
 struct Voxel {
@@ -58,7 +59,7 @@ fn vs_main(
   let half_size = mix(voxel.size_a, voxel.size_b, t) * 0.5;
   let color_a = unpack_color(voxel.color_a);
   let color_b = unpack_color(voxel.color_b);
-  let color = mix(color_a, color_b, t);
+  let color = mix(color_a, color_b, uniforms.color_t);
 
   let half = vec3<f32>(half_size, half_size, half_size);
 
