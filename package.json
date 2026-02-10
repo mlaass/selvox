@@ -1,0 +1,33 @@
+{
+  "name": "selvox",
+  "version": "0.1.0",
+  "description": "WebGPU geospatial voxel visualization library based on Majercik 2018 ray-box intersection",
+  "type": "module",
+  "main": "dist/selvox.cjs",
+  "module": "dist/selvox.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/selvox.js",
+      "require": "./dist/selvox.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && tsc -p tsconfig.build.json --emitDeclarationOnly --outDir dist",
+    "preview": "vite preview",
+    "test": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@webgpu/types": "^0.1.51",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0",
+    "vitest": "^3.0.5"
+  }
+}
