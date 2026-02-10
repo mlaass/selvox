@@ -423,6 +423,16 @@ export class VoxelRenderer {
     return this.pool?.getStats() ?? null;
   }
 
+  getGpuMemoryStats(): { voxelBuffer: number; visibleIndices: number; instanceData: number; indirectArgs: number; uniforms: number; total: number } | null {
+    if (!this.pool) return null;
+    const voxelBuffer = this.maxVoxels * 64;
+    const visibleIndices = this.maxVoxels * 4;
+    const instanceData = this.maxVoxels * INSTANCE_DATA_STRIDE;
+    const indirectArgs = MAX_CHUNKS * INDIRECT_ARGS_STRIDE;
+    const uniforms = UNIFORM_BUFFER_SIZE + MAX_CHUNKS * CHUNK_UNIFORM_STRIDE + MAX_CHUNKS * CULL_UNIFORM_SIZE;
+    return { voxelBuffer, visibleIndices, instanceData, indirectArgs, uniforms, total: voxelBuffer + visibleIndices + instanceData + indirectArgs + uniforms };
+  }
+
   updateCamera(
     viewMatrix: Float32Array,
     projectionMatrix: Float32Array,

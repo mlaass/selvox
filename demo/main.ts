@@ -2,7 +2,7 @@ import { VoxelRenderer, PerformanceOverlay, OverlayMode, PerlinNoise, FlyCamera 
 import { mat4Create, mat4Perspective } from '../src/gpu/math.js';
 
 const VOXEL_STRIDE = 64; // bytes per voxel
-const GRID_SIZE = 200;
+const GRID_SIZE = 800;
 const SURFACE_DEPTH = 25;
 const VOXEL_SIZE = 1.0;
 
@@ -97,7 +97,7 @@ async function main() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
 
-  const renderer = new VoxelRenderer(canvas, { maxVoxels: 2_000_000 });
+  const renderer = new VoxelRenderer(canvas, { maxVoxels: 16_000_000 });
 
   try {
     await renderer.initialize();
@@ -190,8 +190,14 @@ async function main() {
     infoUpdateCounter++;
     if (infoUpdateCounter % 30 === 0) {
       const pos = camPos;
+      const mem = renderer.getGpuMemoryStats();
+      const mb = (b: number) => (b / (1024 * 1024)).toFixed(1);
+      const memLine = mem
+        ? `GPU: ${mb(mem.total)} MB (voxels ${mb(mem.voxelBuffer)}, indices ${mb(mem.visibleIndices)}, instances ${mb(mem.instanceData)}, other ${mb(mem.indirectArgs + mem.uniforms)})`
+        : '';
       infoDiv.textContent =
-        `Voxels: ${renderer.voxelCount} | Draw calls: ${renderer.drawCallCount}\n` +
+        `Voxels: ${renderer.voxelCount.toLocaleString()} | Draws: ${renderer.drawCallCount}\n` +
+        `${memLine}\n` +
         `Pos: [${pos[0].toFixed(1)}, ${pos[1].toFixed(1)}, ${pos[2].toFixed(1)}]\n` +
         `Speed: ${camera.getSpeed().toFixed(1)}\n` +
         `[WASD]fly [Mouse]look [Space/Ctrl]up/down [Shift]fast\n` +

@@ -18,7 +18,12 @@ export async function initWebGPU(canvas: HTMLCanvasElement): Promise<{
     throw new Error('Failed to obtain WebGPU adapter.');
   }
 
-  const device = await adapter.requestDevice();
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    },
+  });
 
   const context = canvas.getContext('webgpu');
   if (!context) {
