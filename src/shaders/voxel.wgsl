@@ -227,6 +227,19 @@ fn fs_main(in: VertexOutput) -> FragOutput {
     }
   }
 
+  // Normals debug: ±XYZ → RGB (bit 3)
+  if (uniforms.debug_flags & 8u) != 0u {
+    lit_color = normal * 0.5 + 0.5;
+  }
+
+  // Depth debug: log-scale depth → grayscale (bit 4)
+  if (uniforms.debug_flags & 16u) != 0u {
+    let linear_z = uniforms.near * uniforms.far /
+      (uniforms.far - frag_depth * (uniforms.far - uniforms.near));
+    let norm_depth = log2(linear_z / uniforms.near) / log2(uniforms.far / uniforms.near);
+    lit_color = vec3<f32>(saturate(norm_depth));
+  }
+
   var out: FragOutput;
   out.color = vec4<f32>(lit_color, 1.0);
   out.depth = frag_depth;

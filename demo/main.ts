@@ -128,10 +128,83 @@ async function main() {
   const overlay = new PerformanceOverlay(canvas);
   let lastTimeMs = -1;
 
-  // Info overlay
-  const infoDiv = document.createElement('div');
-  infoDiv.style.cssText = 'position:fixed;bottom:8px;left:8px;color:#ccc;font:12px monospace;background:rgba(0,0,0,0.65);padding:4px 8px;border-radius:4px;pointer-events:none;z-index:9999;white-space:pre';
-  document.body.appendChild(infoDiv);
+  // Controls panel (toggled with O)
+  const debugToggles: { bit: number; label: string; checkbox: HTMLInputElement }[] = [];
+  const panel = document.createElement('div');
+  panel.style.cssText = 'position:fixed;top:160px;right:8px;color:#ccc;font:12px monospace;background:rgba(0,0,0,0.75);padding:8px;border-radius:4px;pointer-events:auto;z-index:9999;width:180px;display:none';
+
+  const title = document.createElement('div');
+  title.textContent = 'Controls';
+  title.style.cssText = 'font-weight:bold;margin-bottom:6px';
+  panel.appendChild(title);
+
+  const toggleDefs: { bit: number; label: string }[] = [
+    { bit: 0, label: 'LOD colors' },
+    { bit: 1, label: 'Billboard' },
+    { bit: 2, label: 'Wireframe' },
+    { bit: 3, label: 'Normals' },
+    { bit: 4, label: 'Depth' },
+  ];
+
+  function toggleDebugBit(bit: number) {
+    renderer.setDebugFlags(renderer.currentDebugFlags ^ (1 << bit));
+    const entry = debugToggles.find(t => t.bit === bit);
+    if (entry) entry.checkbox.checked = (renderer.currentDebugFlags & (1 << bit)) !== 0;
+  }
+
+  for (const def of toggleDefs) {
+    const label = document.createElement('label');
+    label.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:3px;cursor:pointer';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.style.cssText = 'margin:0;cursor:pointer';
+    const entry = { ...def, checkbox: cb };
+    debugToggles.push(entry);
+    cb.addEventListener('change', () => toggleDebugBit(def.bit));
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(def.label));
+    panel.appendChild(label);
+  }
+
+  // Separator
+  const sep1 = document.createElement('hr');
+  sep1.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';
+  panel.appendChild(sep1);
+
+  // Speed slider
+  const speedRow = document.createElement('div');
+  speedRow.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:2px';
+  const speedLabel = document.createElement('span');
+  speedLabel.textContent = 'Speed';
+  const speedVal = document.createElement('span');
+  speedVal.style.cssText = 'margin-left:auto;min-width:28px;text-align:right';
+  speedVal.textContent = String(Math.round(camera.getSpeed()));
+  const speedSlider = document.createElement('input');
+  speedSlider.type = 'range';
+  speedSlider.min = '1';
+  speedSlider.max = '200';
+  speedSlider.value = String(Math.round(camera.getSpeed()));
+  speedSlider.style.cssText = 'flex:1;cursor:pointer';
+  speedSlider.addEventListener('input', () => {
+    camera.setSpeed(Number(speedSlider.value));
+    speedVal.textContent = speedSlider.value;
+  });
+  speedRow.appendChild(speedLabel);
+  speedRow.appendChild(speedSlider);
+  speedRow.appendChild(speedVal);
+  panel.appendChild(speedRow);
+
+  // Separator
+  const sep2 = document.createElement('hr');
+  sep2.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';
+  panel.appendChild(sep2);
+
+  // Stats section
+  const statsDiv = document.createElement('div');
+  statsDiv.style.cssText = 'white-space:pre';
+  panel.appendChild(statsDiv);
+
+  document.body.appendChild(panel);
 
   // Projection matrix
   const proj = mat4Create();
@@ -140,27 +213,9 @@ async function main() {
   let lastDiagnosticTime = 0;
 
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'p' || e.key === 'P') overlay.cycle();
-    if (e.key === 'l' || e.key === 'L') {
-      renderer.setDebugFlags(renderer.currentDebugFlags ^ 1);
-      console.log(`selvox: LOD debug ${(renderer.currentDebugFlags & 1) ? 'ON' : 'OFF'}`);
-    }
-    if (e.key === 'b' || e.key === 'B') {
-      renderer.setDebugFlags(renderer.currentDebugFlags ^ 2);
-      console.log(`selvox: Billboard debug ${(renderer.currentDebugFlags & 2) ? 'ON' : 'OFF'}`);
-    }
-    if (e.key === 'g' || e.key === 'G') {
-      renderer.setDebugFlags(renderer.currentDebugFlags ^ 4);
-      console.log(`selvox: AABB wireframe debug ${(renderer.currentDebugFlags & 4) ? 'ON' : 'OFF'}`);
-    }
-    if (e.key === '=' || e.key === '+') {
-      camera.setSpeed(camera.getSpeed() * 1.5);
-      console.log(`selvox: speed = ${camera.getSpeed().toFixed(1)}`);
-    }
-    if (e.key === '-' || e.key === '_') {
-      camera.setSpeed(camera.getSpeed() / 1.5);
-      console.log(`selvox: speed = ${camera.getSpeed().toFixed(1)}`);
-    }
+    const k = e.key.toLowerCase();
+    if (k === 'p') overlay.cycle();
+    if (k === 'o') panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
   });
 
   window.addEventListener('resize', () => {
@@ -168,7 +223,7 @@ async function main() {
     overlay.resize();
   });
 
-  let infoUpdateCounter = 0;
+  let statsUpdateCounter = 0;
 
   function frame(timeMs: number) {
     const dt = lastTimeMs < 0 ? 0 : (timeMs - lastTimeMs) * 0.001;
@@ -194,22 +249,13 @@ async function main() {
     const frameDeltaMs = dt * 1000;
     overlay.update({ frameDeltaMs, voxelCount: renderer.voxelCount });
 
-    // Info overlay (every 30 frames)
-    infoUpdateCounter++;
-    if (infoUpdateCounter % 30 === 0) {
+    // Stats update (every 30 frames)
+    statsUpdateCounter++;
+    if (statsUpdateCounter % 30 === 0) {
       const pos = camPos;
-      const mem = renderer.getGpuMemoryStats();
-      const mb = (b: number) => (b / (1024 * 1024)).toFixed(1);
-      const memLine = mem
-        ? `GPU: ${mb(mem.total)} MB (voxels ${mb(mem.voxelBuffer)}, indices ${mb(mem.visibleIndices)}, instances ${mb(mem.instanceData)}, other ${mb(mem.indirectArgs + mem.uniforms)})`
-        : '';
-      infoDiv.textContent =
-        `Voxels: ${renderer.voxelCount.toLocaleString()} | Draws: ${renderer.drawCallCount}\n` +
-        `${memLine}\n` +
-        `Pos: [${pos[0].toFixed(1)}, ${pos[1].toFixed(1)}, ${pos[2].toFixed(1)}]\n` +
-        `Speed: ${camera.getSpeed().toFixed(1)}\n` +
-        `[WASD]fly [Mouse]look [Space/Ctrl]up/down [Shift]fast\n` +
-        `[P]perf [L]LOD [B]billboard [G]wireframe [+/-]speed`;
+      statsDiv.textContent =
+        `Voxels: ${renderer.voxelCount.toLocaleString()}\n` +
+        `Pos: [${pos[0].toFixed(0)}, ${pos[1].toFixed(0)}, ${pos[2].toFixed(0)}]`;
     }
 
     // Diagnostic logging — every 2s when overlay is Expanded
