@@ -13,8 +13,9 @@ struct Uniforms {
 };
 
 struct ChunkUniforms {
-  rte_offset: vec3<f32>,
-  lod_level:  u32,
+  rte_offset:  vec3<f32>,
+  lod_level:   u32,
+  start_slot:  u32,
 };
 
 struct Voxel {
@@ -71,8 +72,9 @@ fn vs_main(
   @builtin(instance_index) iid: u32,
 ) -> VertexOutput {
   // Read precomputed instance data from compute cull pass
-  let inst = instance_data[iid];
-  let voxel_index = visible_indices[iid];
+  let global_iid = chunk.start_slot + iid;
+  let inst = instance_data[global_iid];
+  let voxel_index = visible_indices[global_iid];
   let voxel = voxel_buf.voxels[voxel_index];
   let t = uniforms.interpolation;
 

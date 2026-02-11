@@ -537,6 +537,7 @@ export class VoxelRenderer {
       dv.setFloat32(byteOffset + 4, rteY, true);
       dv.setFloat32(byteOffset + 8, rteZ, true);
       dv.setUint32(byteOffset + 12, chunkInfo.lodLevel, true);
+      dv.setUint32(byteOffset + 16, chunkInfo.startSlot, true);
 
       // Cull uniforms for this chunk (256-byte aligned)
       const cullOffset = chunkInfo.chunkIndex * CULL_UNIFORM_SIZE;
@@ -580,7 +581,7 @@ export class VoxelRenderer {
       clearData.setUint32(argsOffset, 6, true);       // vertex_count
       clearData.setUint32(argsOffset + 4, 0, true);   // instance_count (atomicAdd starts from 0)
       clearData.setUint32(argsOffset + 8, 0, true);   // first_vertex
-      clearData.setUint32(argsOffset + 12, chunkInfo.startSlot, true); // first_instance
+      clearData.setUint32(argsOffset + 12, 0, true); // first_instance (start_slot now in chunk uniforms)
 
       chunkIndex++;
     });
@@ -591,17 +592,17 @@ export class VoxelRenderer {
 
     const encoder = device.createCommandEncoder();
 
-    // --- Compute pass: frustum culling ---
-    const computePass = encoder.beginComputePass();
-    computePass.setPipeline(this.cullPipeline);
-
+    // --- Compute pass(es): frustum culling ---
+    // Use a separate compute pass per chunk to ensure a barrier between dispatches
+    // that write to the same read_write storage buffers at non-overlapping offsets.
     this.pool.forEachChunk((_first, _count, chunkInfo) => {
+      const computePass = encoder.beginComputePass();
+      computePass.setPipeline(this.cullPipeline!);
       computePass.setBindGroup(0, this.cullBindGroup!, [chunkInfo.chunkIndex * CULL_UNIFORM_SIZE]);
       const workgroups = Math.ceil(chunkInfo.voxelCount / WORKGROUP_SIZE);
       computePass.dispatchWorkgroups(workgroups);
+      computePass.end();
     });
-
-    computePass.end();
 
     // --- Render pass ---
     const textureView = this.context.getCurrentTexture().createView();
