@@ -54,6 +54,7 @@ struct VertexOutput {
   @location(3) box_half: vec3<f32>,
   @location(4) color: vec3<f32>,
   @location(5) @interpolate(flat) lod_level: u32,
+  @location(6) quad_uv: vec2<f32>,
 };
 
 fn unpack_color(c: u32) -> vec3<f32> {
@@ -109,7 +110,7 @@ fn vs_main(
   let world_far  = uniforms.inv_view_proj * ndc4_far;
   let p_near = world_near.xyz / world_near.w;
   let p_far  = world_far.xyz / world_far.w;
-  let ray_dir = normalize(p_far - p_near);
+  let ray_dir = p_far - p_near;
 
   var out: VertexOutput;
   out.position = vec4<f32>(ndc_pos, min_depth, 1.0);
@@ -119,6 +120,7 @@ fn vs_main(
   out.box_half = half;
   out.color = color;
   out.lod_level = inst.lod_level;
+  out.quad_uv = quad_uv;
   return out;
 }
 
@@ -150,6 +152,7 @@ fn lod_color(level: u32) -> vec3<f32> {
 
 struct FragOutput {
   @location(0) color: vec4<f32>,
+  @builtin(frag_depth) depth: f32,
 };
 
 @fragment
@@ -172,6 +175,8 @@ fn fs_main(in: VertexOutput) -> FragOutput {
   }
 
   let hit_pos = in.ray_origin + in.ray_dir * t_hit;
+  let hit_clip = uniforms.view_proj * vec4<f32>(hit_pos, 1.0);
+  let frag_depth = hit_clip.z / hit_clip.w;
 
   // Compute face normal from the hit position relative to box center
   let rel = (hit_pos - in.box_center) / in.box_half;
@@ -198,7 +203,32 @@ fn fs_main(in: VertexOutput) -> FragOutput {
     lit_color = mix(lit_color, lod_col * (ambient + diffuse), 0.6);
   }
 
+  // Billboard quad edge debug: yellow outline (bit 1)
+  if (uniforms.debug_flags & 2u) != 0u {
+    let uv_rate = fwidth(in.quad_uv);
+    let edge_px = 1.5;
+    let edge_mask = step(in.quad_uv, uv_rate * edge_px) + step(1.0 - in.quad_uv, uv_rate * edge_px);
+    if max(edge_mask.x, edge_mask.y) > 0.0 {
+      lit_color = vec3<f32>(1.0, 1.0, 0.0);
+    }
+  }
+
+  // AABB wireframe debug: cyan edges on box faces (bit 2)
+  if (uniforms.debug_flags & 4u) != 0u {
+    let edge_threshold = 0.03;
+    let near_edge = vec3<f32>(
+      step(1.0 - edge_threshold, abs_rel.x),
+      step(1.0 - edge_threshold, abs_rel.y),
+      step(1.0 - edge_threshold, abs_rel.z),
+    );
+    let edge_count = near_edge.x + near_edge.y + near_edge.z;
+    if edge_count >= 2.0 {
+      lit_color = vec3<f32>(0.0, 1.0, 1.0);
+    }
+  }
+
   var out: FragOutput;
   out.color = vec4<f32>(lit_color, 1.0);
+  out.depth = frag_depth;
   return out;
 }

@@ -145,6 +145,14 @@ async function main() {
       renderer.setDebugFlags(renderer.currentDebugFlags ^ 1);
       console.log(`selvox: LOD debug ${(renderer.currentDebugFlags & 1) ? 'ON' : 'OFF'}`);
     }
+    if (e.key === 'b' || e.key === 'B') {
+      renderer.setDebugFlags(renderer.currentDebugFlags ^ 2);
+      console.log(`selvox: Billboard debug ${(renderer.currentDebugFlags & 2) ? 'ON' : 'OFF'}`);
+    }
+    if (e.key === 'g' || e.key === 'G') {
+      renderer.setDebugFlags(renderer.currentDebugFlags ^ 4);
+      console.log(`selvox: AABB wireframe debug ${(renderer.currentDebugFlags & 4) ? 'ON' : 'OFF'}`);
+    }
     if (e.key === '=' || e.key === '+') {
       camera.setSpeed(camera.getSpeed() * 1.5);
       console.log(`selvox: speed = ${camera.getSpeed().toFixed(1)}`);
@@ -201,7 +209,7 @@ async function main() {
         `Pos: [${pos[0].toFixed(1)}, ${pos[1].toFixed(1)}, ${pos[2].toFixed(1)}]\n` +
         `Speed: ${camera.getSpeed().toFixed(1)}\n` +
         `[WASD]fly [Mouse]look [Space/Ctrl]up/down [Shift]fast\n` +
-        `[P]perf [L]LOD [+/-]speed`;
+        `[P]perf [L]LOD [B]billboard [G]wireframe [+/-]speed`;
     }
 
     // Diagnostic logging — every 2s when overlay is Expanded
