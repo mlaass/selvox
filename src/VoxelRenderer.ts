@@ -1,9 +1,12 @@
-import type { IVoxelDataSource, RendererOptions } from './types.js';
+import { AAMode, type IVoxelDataSource, type RendererOptions } from './types.js';
 import { initWebGPU } from './gpu/context.js';
 import { mat4Create, mat4Multiply, mat4Invert } from './gpu/math.js';
 import { VoxelPool, type PoolStats } from './gpu/VoxelPool.js';
 import shaderSource from './shaders/voxel.wgsl?raw';
 import cullSource from './shaders/cull.wgsl?raw';
+import blitSource from './shaders/blit.wgsl?raw';
+import taaResolveSource from './shaders/taa_resolve.wgsl?raw';
+import bilateralSource from './shaders/bilateral.wgsl?raw';
 
 const UNIFORM_BUFFER_SIZE = 256; // padded to 256-byte alignment
 const CHUNK_UNIFORM_STRIDE = 256; // 256-byte aligned per chunk
@@ -12,6 +15,9 @@ const CULL_UNIFORM_SIZE = 256; // padded to 256-byte alignment
 const INSTANCE_DATA_STRIDE = 32; // bytes per InstanceData
 const INDIRECT_ARGS_STRIDE = 16; // 4 u32s per drawIndirect call
 const WORKGROUP_SIZE = 256;
+const TAA_UNIFORM_SIZE = 256; // padded to 256-byte alignment
+const BILATERAL_UNIFORM_SIZE = 256; // padded to 256-byte alignment
+const TAA_HALTON_SEQUENCE_LENGTH = 16;
 
 export class VoxelRenderer {
   private canvas: HTMLCanvasElement;
@@ -23,6 +29,7 @@ export class VoxelRenderer {
 
   // Render pipeline state
   private pipeline: GPURenderPipeline | null = null;
+  private pipelineIntermediate: GPURenderPipeline | null = null;
   private bindGroupLayout: GPUBindGroupLayout | null = null;
   private chunkBindGroupLayout: GPUBindGroupLayout | null = null;
   private bindGroup: GPUBindGroup | null = null;
@@ -44,6 +51,36 @@ export class VoxelRenderer {
 
   // Staging buffer for clearing indirect args
   private indirectArgsClearData: ArrayBuffer | null = null;
+
+  // AA state
+  private aaMode: AAMode = AAMode.None;
+  private frameCount = 0;
+  private taaHistoryIndex = 0;
+
+  // Post-process textures
+  private intermediateColor: GPUTexture | null = null;
+  private intermediateColorView: GPUTextureView | null = null;
+  private taaHistory: [GPUTexture | null, GPUTexture | null] = [null, null];
+  private taaHistoryViews: [GPUTextureView | null, GPUTextureView | null] = [null, null];
+  private postProcessOutput: GPUTexture | null = null;
+  private postProcessOutputView: GPUTextureView | null = null;
+
+  // Post-process pipelines
+  private blitPipeline: GPURenderPipeline | null = null;
+  private blitBindGroupLayout: GPUBindGroupLayout | null = null;
+  private blitSampler: GPUSampler | null = null;
+
+  private taaPipeline: GPUComputePipeline | null = null;
+  private taaBindGroupLayout: GPUBindGroupLayout | null = null;
+  private taaUniformBuffer: GPUBuffer | null = null;
+
+  private bilateralPipeline: GPUComputePipeline | null = null;
+  private bilateralBindGroupLayout: GPUBindGroupLayout | null = null;
+  private bilateralUniformBuffer: GPUBuffer | null = null;
+
+  // TAA jitter state
+  private prevViewProjMatrix = new Float32Array(16);
+  private hasPrevViewProj = false;
 
   // Camera / uniform data (CPU-side)
   private uniformData = new ArrayBuffer(UNIFORM_BUFFER_SIZE);
@@ -147,7 +184,30 @@ export class VoxelRenderer {
         cullMode: 'none',
       },
       depthStencil: {
-        format: 'depth24plus',
+        format: 'depth32float',
+        depthWriteEnabled: true,
+        depthCompare: 'less',
+      },
+    });
+
+    // Pipeline variant for rendering to rgba16float intermediate (modes 2/3)
+    this.pipelineIntermediate = device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: {
+        module: shaderModule,
+        entryPoint: 'vs_main',
+      },
+      fragment: {
+        module: shaderModule,
+        entryPoint: 'fs_main',
+        targets: [{ format: 'rgba16float' }],
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'none',
+      },
+      depthStencil: {
+        format: 'depth32float',
         depthWriteEnabled: true,
         depthCompare: 'less',
       },
@@ -238,7 +298,79 @@ export class VoxelRenderer {
     // Bind groups are created lazily since they depend on the pool buffer
     this.recreateBindGroups();
 
-    this.createDepthTexture(this.canvas.width, this.canvas.height);
+    // --- Post-process pipelines ---
+    this.initPostProcessPipelines(device);
+
+    this.createRenderTargets(this.canvas.width, this.canvas.height);
+  }
+
+  private initPostProcessPipelines(device: GPUDevice): void {
+    const blitModule = device.createShaderModule({ code: blitSource });
+    const taaModule = device.createShaderModule({ code: taaResolveSource });
+    const bilateralModule = device.createShaderModule({ code: bilateralSource });
+
+    // --- Blit pipeline ---
+    this.blitBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+      ],
+    });
+
+    this.blitPipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.blitBindGroupLayout] }),
+      vertex: { module: blitModule, entryPoint: 'vs_main' },
+      fragment: {
+        module: blitModule,
+        entryPoint: 'fs_main',
+        targets: [{ format: this.format! }],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+
+    this.blitSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+    // --- TAA resolve pipeline ---
+    this.taaBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+      ],
+    });
+
+    this.taaPipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.taaBindGroupLayout] }),
+      compute: { module: taaModule, entryPoint: 'taa_main' },
+    });
+
+    this.taaUniformBuffer = device.createBuffer({
+      size: TAA_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    // --- Bilateral filter pipeline ---
+    this.bilateralBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+      ],
+    });
+
+    this.bilateralPipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.bilateralBindGroupLayout] }),
+      compute: { module: bilateralModule, entryPoint: 'bilateral_main' },
+    });
+
+    this.bilateralUniformBuffer = device.createBuffer({
+      size: BILATERAL_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
   }
 
   private recreateBindGroups(): void {
@@ -293,15 +425,55 @@ export class VoxelRenderer {
     });
   }
 
-  private createDepthTexture(w: number, h: number): void {
+  private createRenderTargets(w: number, h: number): void {
     if (!this.device) return;
+    const width = Math.max(1, w);
+    const height = Math.max(1, h);
+
+    // Destroy old textures
     this.depthTexture?.destroy();
+    this.intermediateColor?.destroy();
+    this.taaHistory[0]?.destroy();
+    this.taaHistory[1]?.destroy();
+    this.postProcessOutput?.destroy();
+
+    // Depth texture — depth32float for post-process readability
     this.depthTexture = this.device.createTexture({
-      size: [Math.max(1, w), Math.max(1, h)],
-      format: 'depth24plus',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      size: [width, height],
+      format: 'depth32float',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.depthTextureView = this.depthTexture.createView();
+
+    // Intermediate color — render target for modes 2/3
+    this.intermediateColor = this.device.createTexture({
+      size: [width, height],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.intermediateColorView = this.intermediateColor.createView();
+
+    // TAA history ping-pong buffers
+    for (let i = 0; i < 2; i++) {
+      this.taaHistory[i] = this.device.createTexture({
+        size: [width, height],
+        format: 'rgba16float',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+      });
+      this.taaHistoryViews[i] = this.taaHistory[i]!.createView();
+    }
+
+    // Post-process output (bilateral)
+    this.postProcessOutput = this.device.createTexture({
+      size: [width, height],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.postProcessOutputView = this.postProcessOutput.createView();
+
+    // Reset TAA history on resize
+    this.hasPrevViewProj = false;
+    this.taaHistoryIndex = 0;
   }
 
   /** Extract 6 frustum planes from a column-major view-projection matrix (Gribb-Hartmann). */
@@ -428,6 +600,31 @@ export class VoxelRenderer {
     return this.lastDrawCallCount;
   }
 
+  setAAMode(mode: AAMode): void {
+    if (this.aaMode !== mode) {
+      this.aaMode = mode;
+      this.hasPrevViewProj = false;
+      this.taaHistoryIndex = 0;
+      this.frameCount = 0;
+    }
+  }
+
+  get currentAAMode(): AAMode {
+    return this.aaMode;
+  }
+
+  private halton(index: number, base: number): number {
+    let result = 0;
+    let f = 1 / base;
+    let i = index;
+    while (i > 0) {
+      result += f * (i % base);
+      i = Math.floor(i / base);
+      f /= base;
+    }
+    return result;
+  }
+
   getPoolStats(): PoolStats | null {
     return this.pool?.getStats() ?? null;
   }
@@ -460,22 +657,38 @@ export class VoxelRenderer {
       rteView = viewMatrix;
     }
 
-    const viewProj = mat4Create();
-    mat4Multiply(viewProj, projectionMatrix, rteView);
+    // Compute unjittered view-proj first (for TAA prev frame + frustum culling)
+    const unjitteredViewProj = mat4Create();
+    mat4Multiply(unjitteredViewProj, projectionMatrix, rteView);
 
-    // Cache VP matrix for frustum extraction
-    this.viewProjMatrix.set(viewProj);
+    // Save previous unjittered VP for TAA reprojection
+    if (this.hasPrevViewProj) {
+      this.prevViewProjMatrix.set(this.viewProjMatrix);
+    }
 
-    const invViewProj = mat4Create();
-    mat4Invert(invViewProj, viewProj);
+    // Cache unjittered VP for frustum extraction (culling always uses unjittered)
+    this.viewProjMatrix.set(unjitteredViewProj);
+
+    // Compute jitter for TAA (used in vertex shader position offset, not in VP matrix)
+    let jitterX = 0;
+    let jitterY = 0;
+    if (this.aaMode === AAMode.TAA) {
+      const sampleIndex = (this.frameCount % TAA_HALTON_SEQUENCE_LENGTH) + 1;
+      jitterX = (this.halton(sampleIndex, 2) - 0.5) * 2.0 / this.canvas.width;
+      jitterY = (this.halton(sampleIndex, 3) - 0.5) * 2.0 / this.canvas.height;
+    }
+
+    // Always use unjittered VP/inv_VP for main uniforms — stable ray reconstruction
+    const unjitteredInvViewProj = mat4Create();
+    mat4Invert(unjitteredInvViewProj, unjitteredViewProj);
 
     const f = this.uniformFloats;
     const u = this.uniformUints;
 
-    // view_proj: offset 0 (16 floats)
-    f.set(viewProj, 0);
-    // inv_view_proj: offset 16 (16 floats)
-    f.set(invViewProj, 16);
+    // view_proj: offset 0 (16 floats) — always unjittered
+    f.set(unjitteredViewProj, 0);
+    // inv_view_proj: offset 16 (16 floats) — always unjittered
+    f.set(unjitteredInvViewProj, 16);
     // camera_pos: offset 32 (3 floats)
     if (positionHigh) {
       f[32] = 0;
@@ -501,17 +714,63 @@ export class VoxelRenderer {
     f[40] = this.colorInterpolation;
     // debug_flags: offset 41 (u32)
     u[41] = this.debugFlags;
+    // aa_mode: offset 42 (u32)
+    u[42] = this.aaMode;
+    // jitter_x: offset 43, jitter_y: offset 44
+    f[43] = jitterX;
+    f[44] = jitterY;
+
+    // Update TAA uniforms if in TAA mode
+    if (this.aaMode === AAMode.TAA && this.taaUniformBuffer && this.device) {
+      const taaData = new ArrayBuffer(TAA_UNIFORM_SIZE);
+      const taaFloats = new Float32Array(taaData);
+
+      // inv_view_proj (unjittered — matches depth buffer): offset 0
+      taaFloats.set(unjitteredInvViewProj, 0);
+      // prev_view_proj (unjittered): offset 16
+      if (this.hasPrevViewProj) {
+        taaFloats.set(this.prevViewProjMatrix, 16);
+      } else {
+        taaFloats.set(unjitteredViewProj, 16);
+      }
+      // viewport_size: offset 32
+      taaFloats[32] = this.canvas.width;
+      taaFloats[33] = this.canvas.height;
+      // jitter: offset 34
+      taaFloats[34] = jitterX;
+      taaFloats[35] = jitterY;
+      // blend_factor: offset 36
+      taaFloats[36] = (!this.hasPrevViewProj || this.frameCount === 0) ? 1.0 : 0.1;
+
+      this.device.queue.writeBuffer(this.taaUniformBuffer, 0, taaData);
+    }
+
+    // Update bilateral uniforms if in bilateral mode
+    if (this.aaMode === AAMode.Bilateral && this.bilateralUniformBuffer && this.device) {
+      const bilData = new ArrayBuffer(BILATERAL_UNIFORM_SIZE);
+      const bilFloats = new Float32Array(bilData);
+      bilFloats[0] = this.canvas.width;
+      bilFloats[1] = this.canvas.height;
+      bilFloats[2] = 2.0;  // sigma_spatial
+      bilFloats[3] = 0.1;  // sigma_color
+      bilFloats[4] = 0.01; // sigma_depth
+      this.device.queue.writeBuffer(this.bilateralUniformBuffer, 0, bilData);
+    }
+
+    this.hasPrevViewProj = true;
   }
 
   render(): void {
     if (
-      !this.device || !this.context || !this.pipeline || !this.cullPipeline ||
+      !this.device || !this.context || !this.pipeline || !this.pipelineIntermediate ||
+      !this.cullPipeline ||
       !this.bindGroup || !this.chunkBindGroup || !this.cullBindGroup ||
       !this.depthTextureView || !this.pool || !this.chunkUniformBuffer ||
       !this.cullUniformBuffer || !this.indirectArgsBuffer || !this.indirectArgsClearData
     ) return;
 
     const device = this.device;
+    const usePostProcess = this.aaMode === AAMode.TAA || this.aaMode === AAMode.Bilateral;
 
     // Write global uniforms
     device.queue.writeBuffer(this.uniformBuffer!, 0, this.uniformData);
@@ -588,6 +847,9 @@ export class VoxelRenderer {
       // subpixel_threshold: f32 at offset 200
       cullDv.setFloat32(cullOffset + 200, this.subpixelThreshold, true);
 
+      // aa_mode: u32 at offset 204
+      cullDv.setUint32(cullOffset + 204, this.aaMode, true);
+
       // Clear indirect args for this chunk: vertex_count=6, instance_count=0, first_vertex=0, first_instance=start_slot
       const argsOffset = chunkInfo.chunkIndex * INDIRECT_ARGS_STRIDE;
       clearData.setUint32(argsOffset, 6, true);       // vertex_count
@@ -605,8 +867,6 @@ export class VoxelRenderer {
     const encoder = device.createCommandEncoder();
 
     // --- Compute pass(es): frustum culling ---
-    // Use a separate compute pass per chunk to ensure a barrier between dispatches
-    // that write to the same read_write storage buffers at non-overlapping offsets.
     this.pool.forEachChunk((_first, _count, chunkInfo) => {
       const computePass = encoder.beginComputePass();
       computePass.setPipeline(this.cullPipeline!);
@@ -617,10 +877,14 @@ export class VoxelRenderer {
     });
 
     // --- Render pass ---
+    const colorTarget = usePostProcess
+      ? this.intermediateColorView!
+      : this.context.getCurrentTexture().createView();
+
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
-          view: this.context.getCurrentTexture().createView(),
+          view: colorTarget,
           clearValue: { r: 0.05, g: 0.05, b: 0.08, a: 1.0 },
           loadOp: 'clear' as const,
           storeOp: 'store' as const,
@@ -630,11 +894,11 @@ export class VoxelRenderer {
         view: this.depthTextureView,
         depthClearValue: 1.0,
         depthLoadOp: 'clear',
-        depthStoreOp: 'discard',
+        depthStoreOp: usePostProcess ? 'store' : 'discard',
       },
     });
 
-    pass.setPipeline(this.pipeline);
+    pass.setPipeline(usePostProcess ? this.pipelineIntermediate : this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
 
     let drawCalls = 0;
@@ -647,17 +911,118 @@ export class VoxelRenderer {
 
     pass.end();
 
+    // --- Post-process pass (modes 2/3) ---
+    if (usePostProcess) {
+      let blitSource: GPUTextureView;
+
+      if (this.aaMode === AAMode.TAA) {
+        blitSource = this.runTAAResolve(encoder);
+      } else {
+        blitSource = this.runBilateralFilter(encoder);
+      }
+
+      // Blit result to canvas
+      this.runBlit(encoder, blitSource);
+    }
+
     device.queue.submit([encoder.finish()]);
+    this.frameCount++;
+  }
+
+  private runTAAResolve(encoder: GPUCommandEncoder): GPUTextureView {
+    const device = this.device!;
+    const currentHistoryIdx = this.taaHistoryIndex;
+    const prevHistoryIdx = 1 - currentHistoryIdx;
+    const outputView = this.taaHistoryViews[currentHistoryIdx]!;
+
+    const bindGroup = device.createBindGroup({
+      layout: this.taaBindGroupLayout!,
+      entries: [
+        { binding: 0, resource: { buffer: this.taaUniformBuffer! } },
+        { binding: 1, resource: this.intermediateColorView! },
+        { binding: 2, resource: this.depthTextureView! },
+        { binding: 3, resource: this.taaHistoryViews[prevHistoryIdx]! },
+        { binding: 4, resource: this.blitSampler! },
+        { binding: 5, resource: outputView },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.taaPipeline!);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(
+      Math.ceil(this.canvas.width / 8),
+      Math.ceil(this.canvas.height / 8),
+    );
+    pass.end();
+
+    // Flip history index for next frame
+    this.taaHistoryIndex = prevHistoryIdx;
+
+    return outputView;
+  }
+
+  private runBilateralFilter(encoder: GPUCommandEncoder): GPUTextureView {
+    const device = this.device!;
+
+    const bindGroup = device.createBindGroup({
+      layout: this.bilateralBindGroupLayout!,
+      entries: [
+        { binding: 0, resource: { buffer: this.bilateralUniformBuffer! } },
+        { binding: 1, resource: this.intermediateColorView! },
+        { binding: 2, resource: this.depthTextureView! },
+        { binding: 3, resource: this.postProcessOutputView! },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.bilateralPipeline!);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(
+      Math.ceil(this.canvas.width / 8),
+      Math.ceil(this.canvas.height / 8),
+    );
+    pass.end();
+
+    return this.postProcessOutputView!;
+  }
+
+  private runBlit(encoder: GPUCommandEncoder, sourceView: GPUTextureView): void {
+    const bindGroup = this.device!.createBindGroup({
+      layout: this.blitBindGroupLayout!,
+      entries: [
+        { binding: 0, resource: sourceView },
+        { binding: 1, resource: this.blitSampler! },
+      ],
+    });
+
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.context!.getCurrentTexture().createView(),
+        loadOp: 'clear' as const,
+        storeOp: 'store' as const,
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+
+    pass.setPipeline(this.blitPipeline!);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(3);
+    pass.end();
   }
 
   resize(width: number, height: number): void {
     this.canvas.width = width;
     this.canvas.height = height;
-    this.createDepthTexture(width, height);
+    this.createRenderTargets(width, height);
   }
 
   dispose(): void {
     this.depthTexture?.destroy();
+    this.intermediateColor?.destroy();
+    this.taaHistory[0]?.destroy();
+    this.taaHistory[1]?.destroy();
+    this.postProcessOutput?.destroy();
     this.pool?.dispose();
     this.uniformBuffer?.destroy();
     this.chunkUniformBuffer?.destroy();
@@ -665,8 +1030,16 @@ export class VoxelRenderer {
     this.visibleIndicesBuffer?.destroy();
     this.instanceDataBuffer?.destroy();
     this.indirectArgsBuffer?.destroy();
+    this.taaUniformBuffer?.destroy();
+    this.bilateralUniformBuffer?.destroy();
     this.depthTexture = null;
     this.depthTextureView = null;
+    this.intermediateColor = null;
+    this.intermediateColorView = null;
+    this.taaHistory = [null, null];
+    this.taaHistoryViews = [null, null];
+    this.postProcessOutput = null;
+    this.postProcessOutputView = null;
     this.pool = null;
     this.uniformBuffer = null;
     this.chunkUniformBuffer = null;
@@ -675,7 +1048,10 @@ export class VoxelRenderer {
     this.instanceDataBuffer = null;
     this.indirectArgsBuffer = null;
     this.indirectArgsClearData = null;
+    this.taaUniformBuffer = null;
+    this.bilateralUniformBuffer = null;
     this.pipeline = null;
+    this.pipelineIntermediate = null;
     this.bindGroup = null;
     this.chunkBindGroup = null;
     this.cullBindGroup = null;
@@ -683,6 +1059,13 @@ export class VoxelRenderer {
     this.chunkBindGroupLayout = null;
     this.cullBindGroupLayout = null;
     this.cullPipeline = null;
+    this.blitPipeline = null;
+    this.blitBindGroupLayout = null;
+    this.blitSampler = null;
+    this.taaPipeline = null;
+    this.taaBindGroupLayout = null;
+    this.bilateralPipeline = null;
+    this.bilateralBindGroupLayout = null;
     this.context?.unconfigure();
     this.device?.destroy();
     this.device = null;

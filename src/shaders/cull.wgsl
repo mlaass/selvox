@@ -11,6 +11,7 @@ struct CullUniforms {
   start_slot:     u32,           // 192
   chunk_index:    u32,           // 196
   subpixel_threshold: f32,      // 200
+  aa_mode:            u32,      // 204
 };
 
 struct Voxel {
@@ -124,6 +125,13 @@ fn cull_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let pad = vec2<f32>(2.0 / cull.viewport_size.x, 2.0 / cull.viewport_size.y) * pad_scale;
   ndc_min = ndc_min - pad;
   ndc_max = ndc_max + pad;
+
+  // TAA: ensure at least 1px billboard padding for sub-pixel jitter coverage
+  if cull.aa_mode == 2u {
+    let taa_pad = vec2<f32>(2.0 / cull.viewport_size.x, 2.0 / cull.viewport_size.y);
+    ndc_min = ndc_min - taa_pad;
+    ndc_max = ndc_max + taa_pad;
+  }
 
   // Clamp to clip space
   ndc_min = clamp(ndc_min, vec2<f32>(-1.0), vec2<f32>(1.0));

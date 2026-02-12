@@ -10,6 +10,9 @@ struct Uniforms {
   far:            f32,           // 156
   color_t:        f32,           // 160
   debug_flags:    u32,           // 164
+  aa_mode:        u32,           // 168
+  jitter_x:       f32,           // 172
+  jitter_y:       f32,           // 176
 };
 
 struct ChunkUniforms {
@@ -115,7 +118,13 @@ fn vs_main(
   let ray_dir = p_far - p_near;
 
   var out: VertexOutput;
-  out.position = vec4<f32>(ndc_pos, min_depth, 1.0);
+  // TAA: offset rasterization position by jitter (shifts which pixel the fragment maps to)
+  // Ray reconstruction above uses unjittered ndc_pos + unjittered inv_VP → stable rays
+  var pos_ndc = ndc_pos;
+  if uniforms.aa_mode == 2u {
+    pos_ndc = ndc_pos + vec2<f32>(uniforms.jitter_x, uniforms.jitter_y);
+  }
+  out.position = vec4<f32>(pos_ndc, min_depth, 1.0);
   out.ray_origin = uniforms.camera_pos;
   out.ray_dir = ray_dir;
   out.box_center = center;
@@ -245,13 +254,31 @@ fn fs_main(in: VertexOutput) -> FragOutput {
 
   var lit_color = center.color;
 
-  // Edge detection: check if hit is near a cube edge (two face boundaries)
+  // Hit position relative to box (used by edge SS and wireframe debug)
   let abs_rel = abs((center.hit_pos - in.box_center) / in.box_half);
-  let mx = max(abs_rel.x, max(abs_rel.y, abs_rel.z));
-  let mn = min(abs_rel.x, min(abs_rel.y, abs_rel.z));
-  let mid = abs_rel.x + abs_rel.y + abs_rel.z - mx - mn;
 
-  if mid > 0.92 {
+  // Determine if supersampling is needed
+  var needs_supersample = false;
+
+  // Distance-adaptive SS (mode 1): supersample small distant voxels
+  if uniforms.aa_mode == 1u {
+    let screen_px = 1.0 / fwidth(in.quad_uv);
+    if min(screen_px.x, screen_px.y) < 4.0 {
+      needs_supersample = true;
+    }
+  }
+
+  // Edge detection for modes 0 and 1: check if hit is near a cube edge
+  if uniforms.aa_mode <= 1u {
+    let mx = max(abs_rel.x, max(abs_rel.y, abs_rel.z));
+    let mn = min(abs_rel.x, min(abs_rel.y, abs_rel.z));
+    let mid = abs_rel.x + abs_rel.y + abs_rel.z - mx - mn;
+    if mid > 0.92 {
+      needs_supersample = true;
+    }
+  }
+
+  if needs_supersample {
     // RGSS 4x sub-pixel rays
     let d0 = in.ray_dir + ddx_dir * -0.125 + ddy_dir * -0.375;
     let d1 = in.ray_dir + ddx_dir *  0.375 + ddy_dir * -0.125;

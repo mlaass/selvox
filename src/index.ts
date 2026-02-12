@@ -1,4 +1,5 @@
 export { VoxelRenderer } from './VoxelRenderer.js';
+export { AAMode } from './types.js';
 export type {
   RendererOptions,
   IVoxelDataSource,

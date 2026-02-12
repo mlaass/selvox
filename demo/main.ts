@@ -1,4 +1,4 @@
-import { VoxelRenderer, PerformanceOverlay, OverlayMode, PerlinNoise, FlyCamera } from '../src/index.js';
+import { VoxelRenderer, PerformanceOverlay, OverlayMode, PerlinNoise, FlyCamera, AAMode } from '../src/index.js';
 import { mat4Create, mat4Perspective } from '../src/gpu/math.js';
 
 const VOXEL_STRIDE = 64; // bytes per voxel
@@ -358,6 +358,32 @@ async function main() {
   const sep2 = document.createElement('hr');
   sep2.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';
   panel.appendChild(sep2);
+
+  // AA mode dropdown
+  const aaRow = document.createElement('div');
+  aaRow.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:4px';
+  const aaLabel = document.createElement('span');
+  aaLabel.textContent = 'AA';
+  const aaSelect = document.createElement('select');
+  aaSelect.style.cssText = 'flex:1;cursor:pointer;background:#333;color:#ccc;border:1px solid #555;border-radius:2px;font:11px monospace;padding:1px 2px';
+  const aaNames = ['None', 'Dist. Adaptive SS', 'TAA', 'Bilateral Filter'];
+  aaNames.forEach((name, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = name;
+    aaSelect.appendChild(opt);
+  });
+  aaSelect.addEventListener('change', () => {
+    renderer.setAAMode(Number(aaSelect.value) as AAMode);
+  });
+  aaRow.appendChild(aaLabel);
+  aaRow.appendChild(aaSelect);
+  panel.appendChild(aaRow);
+
+  // Separator
+  const sep3 = document.createElement('hr');
+  sep3.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';
+  panel.appendChild(sep3);
 
   // Stats section
   const statsDiv = document.createElement('div');

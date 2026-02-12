@@ -1,3 +1,10 @@
+export const enum AAMode {
+  None = 0,
+  DistanceSS = 1,
+  TAA = 2,
+  Bilateral = 3,
+}
+
 export interface RendererOptions {
   /** Whether to enable anti-aliasing. Default: true */
   antialias?: boolean;
