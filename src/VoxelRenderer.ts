@@ -7,6 +7,7 @@ import cullSource from './shaders/cull.wgsl?raw';
 import blitSource from './shaders/blit.wgsl?raw';
 import taaResolveSource from './shaders/taa_resolve.wgsl?raw';
 import bilateralSource from './shaders/bilateral.wgsl?raw';
+import casSource from './shaders/cas.wgsl?raw';
 
 const UNIFORM_BUFFER_SIZE = 256; // padded to 256-byte alignment
 const CHUNK_UNIFORM_STRIDE = 256; // 256-byte aligned per chunk
@@ -17,6 +18,7 @@ const INDIRECT_ARGS_STRIDE = 16; // 4 u32s per drawIndirect call
 const WORKGROUP_SIZE = 256;
 const TAA_UNIFORM_SIZE = 256; // padded to 256-byte alignment
 const BILATERAL_UNIFORM_SIZE = 256; // padded to 256-byte alignment
+const CAS_UNIFORM_SIZE = 256; // padded to 256-byte alignment
 const TAA_HALTON_SEQUENCE_LENGTH = 16;
 
 export class VoxelRenderer {
@@ -77,6 +79,11 @@ export class VoxelRenderer {
   private bilateralPipeline: GPUComputePipeline | null = null;
   private bilateralBindGroupLayout: GPUBindGroupLayout | null = null;
   private bilateralUniformBuffer: GPUBuffer | null = null;
+
+  private casPipeline: GPUComputePipeline | null = null;
+  private casBindGroupLayout: GPUBindGroupLayout | null = null;
+  private casUniformBuffer: GPUBuffer | null = null;
+  private casSharpness = 0.5;
 
   // TAA jitter state
   private prevViewProjMatrix = new Float32Array(16);
@@ -373,6 +380,27 @@ export class VoxelRenderer {
       size: BILATERAL_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+
+    // --- CAS sharpening pipeline ---
+    const casModule = device.createShaderModule({ code: casSource });
+
+    this.casBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+      ],
+    });
+
+    this.casPipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.casBindGroupLayout] }),
+      compute: { module: casModule, entryPoint: 'cas_main' },
+    });
+
+    this.casUniformBuffer = device.createBuffer({
+      size: CAS_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
   }
 
   private recreateBindGroups(): void {
@@ -614,6 +642,14 @@ export class VoxelRenderer {
     return this.bevelRadius;
   }
 
+  setCASSharpness(value: number): void {
+    this.casSharpness = Math.max(0.0, Math.min(1.0, value));
+  }
+
+  get currentCASSharpness(): number {
+    return this.casSharpness;
+  }
+
   get drawCallCount(): number {
     return this.lastDrawCallCount;
   }
@@ -761,8 +797,14 @@ export class VoxelRenderer {
       // jitter: offset 34
       taaFloats[34] = jitterX;
       taaFloats[35] = jitterY;
-      // blend_factor: offset 36
-      taaFloats[36] = (!this.hasPrevViewProj || this.frameCount === 0) ? 1.0 : 0.1;
+      // blend_factor: offset 36 — 1.0 = first frame (reset), 0.0 = use adaptive blend
+      taaFloats[36] = (!this.hasPrevViewProj || this.frameCount === 0) ? 1.0 : 0.0;
+      // near: offset 37
+      taaFloats[37] = 0.1;
+      // far: offset 38
+      taaFloats[38] = 10000.0;
+      // gamma: offset 39 — variance clipping tightness
+      taaFloats[39] = 1.25;
 
       this.device.queue.writeBuffer(this.taaUniformBuffer, 0, taaData);
     }
@@ -946,6 +988,11 @@ export class VoxelRenderer {
         blitSource = this.runBilateralFilter(encoder);
       }
 
+      // CAS sharpening after TAA (skip if sharpness is 0)
+      if (this.aaMode === AAMode.TAA && this.casSharpness > 0) {
+        blitSource = this.runCAS(encoder, blitSource);
+      }
+
       // Blit result to canvas
       this.runBlit(encoder, blitSource);
     }
@@ -1012,6 +1059,38 @@ export class VoxelRenderer {
     return this.postProcessOutputView!;
   }
 
+  private runCAS(encoder: GPUCommandEncoder, sourceView: GPUTextureView): GPUTextureView {
+    const device = this.device!;
+
+    // Write CAS uniforms
+    const casData = new ArrayBuffer(CAS_UNIFORM_SIZE);
+    const casFloats = new Float32Array(casData);
+    casFloats[0] = this.canvas.width;
+    casFloats[1] = this.canvas.height;
+    casFloats[2] = this.casSharpness;
+    device.queue.writeBuffer(this.casUniformBuffer!, 0, casData);
+
+    const bindGroup = device.createBindGroup({
+      layout: this.casBindGroupLayout!,
+      entries: [
+        { binding: 0, resource: { buffer: this.casUniformBuffer! } },
+        { binding: 1, resource: sourceView },
+        { binding: 2, resource: this.postProcessOutputView! },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.casPipeline!);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(
+      Math.ceil(this.canvas.width / 8),
+      Math.ceil(this.canvas.height / 8),
+    );
+    pass.end();
+
+    return this.postProcessOutputView!;
+  }
+
   private runBlit(encoder: GPUCommandEncoder, sourceView: GPUTextureView): void {
     const bindGroup = this.device!.createBindGroup({
       layout: this.blitBindGroupLayout!,
@@ -1057,6 +1136,7 @@ export class VoxelRenderer {
     this.indirectArgsBuffer?.destroy();
     this.taaUniformBuffer?.destroy();
     this.bilateralUniformBuffer?.destroy();
+    this.casUniformBuffer?.destroy();
     this.depthTexture = null;
     this.depthTextureView = null;
     this.intermediateColor = null;
@@ -1075,6 +1155,7 @@ export class VoxelRenderer {
     this.indirectArgsClearData = null;
     this.taaUniformBuffer = null;
     this.bilateralUniformBuffer = null;
+    this.casUniformBuffer = null;
     this.pipeline = null;
     this.pipelineIntermediate = null;
     this.bindGroup = null;
@@ -1091,6 +1172,8 @@ export class VoxelRenderer {
     this.taaBindGroupLayout = null;
     this.bilateralPipeline = null;
     this.bilateralBindGroupLayout = null;
+    this.casPipeline = null;
+    this.casBindGroupLayout = null;
     this.context?.unconfigure();
     this.device?.destroy();
     this.device = null;

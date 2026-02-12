@@ -334,8 +334,8 @@ fn fs_main(in: VertexOutput) -> FragOutput {
     }
   }
 
-  // Edge detection for modes 0 and 1: check if hit is near a cube edge
-  if uniforms.aa_mode <= 1u {
+  // Edge detection for modes 0, 1, and 2 (TAA): check if hit is near a cube edge
+  if uniforms.aa_mode <= 2u {
     let mx = max(abs_rel.x, max(abs_rel.y, abs_rel.z));
     let mn = min(abs_rel.x, min(abs_rel.y, abs_rel.z));
     let mid = abs_rel.x + abs_rel.y + abs_rel.z - mx - mn;

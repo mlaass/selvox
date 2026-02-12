@@ -430,6 +430,31 @@ async function main() {
   aaRow.appendChild(aaSelect);
   panel.appendChild(aaRow);
 
+  // CAS Sharpness slider
+  const sharpRow = document.createElement('div');
+  sharpRow.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:2px';
+  const sharpLabel = document.createElement('span');
+  sharpLabel.textContent = 'Sharp';
+  const sharpVal = document.createElement('span');
+  sharpVal.style.cssText = 'margin-left:auto;min-width:28px;text-align:right';
+  sharpVal.textContent = '0.50';
+  const sharpSlider = document.createElement('input');
+  sharpSlider.type = 'range';
+  sharpSlider.min = '0';
+  sharpSlider.max = '1';
+  sharpSlider.step = '0.05';
+  sharpSlider.value = '0.5';
+  sharpSlider.style.cssText = 'flex:1;cursor:pointer';
+  sharpSlider.addEventListener('input', () => {
+    const v = Number(sharpSlider.value);
+    renderer.setCASSharpness(v);
+    sharpVal.textContent = v.toFixed(2);
+  });
+  sharpRow.appendChild(sharpLabel);
+  sharpRow.appendChild(sharpSlider);
+  sharpRow.appendChild(sharpVal);
+  panel.appendChild(sharpRow);
+
   // Separator
   const sep3 = document.createElement('hr');
   sep3.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';
