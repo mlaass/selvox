@@ -14,6 +14,7 @@ struct Uniforms {
   jitter_x:       f32,           // 172
   jitter_y:       f32,           // 176
   voxel_scale:    f32,           // 180
+  bevel_radius:   f32,           // 184
 };
 
 struct ChunkUniforms {
@@ -148,6 +149,52 @@ fn ray_aabb(ray_origin: vec3<f32>, ray_dir: vec3<f32>, box_min: vec3<f32>, box_m
   return vec2<f32>(tmin, tmax);
 }
 
+// Rounded box SDF — distance from point p to surface of box with half-extents b, rounded by r
+fn sd_round_box(p: vec3<f32>, b: vec3<f32>, r: f32) -> f32 {
+  let q = abs(p) - b + r;
+  return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
+}
+
+// Analytical normal of rounded box SDF via gradient
+fn sd_round_box_normal(p: vec3<f32>, b: vec3<f32>, r: f32) -> vec3<f32> {
+  let q = abs(p) - b + r;
+  // Gradient of the SDF: sign(p) * normalize(max(q, 0)) when outside, sign of dominant axis when inside
+  let outside = max(q, vec3<f32>(0.0));
+  let len = length(outside);
+  if len > 0.0001 {
+    return normalize(sign(p) * outside);
+  }
+  // Inside: normal points along the axis with the largest q component
+  let ap = abs(p);
+  if q.x > q.y && q.x > q.z {
+    return vec3<f32>(sign(p.x), 0.0, 0.0);
+  } else if q.y > q.z {
+    return vec3<f32>(0.0, sign(p.y), 0.0);
+  } else {
+    return vec3<f32>(0.0, 0.0, sign(p.z));
+  }
+}
+
+// Sphere-trace the rounded box SDF within [t_start, t_end], returns hit t or -1.0 on miss
+fn trace_round_box(ray_origin: vec3<f32>, ray_dir: vec3<f32>, center: vec3<f32>, half: vec3<f32>, bevel: f32, t_start: f32, t_end: f32) -> f32 {
+  var t = t_start;
+  let dir = normalize(ray_dir);
+  let dir_len = length(ray_dir);
+  for (var i = 0; i < 16; i++) {
+    let p = ray_origin + ray_dir * t - center;
+    let d = sd_round_box(p, half, bevel);
+    if d < 0.0005 * (t * dir_len) {
+      return t;
+    }
+    // Advance by SDF distance divided by ray direction length (since ray_dir may not be unit)
+    t += d / dir_len;
+    if t > t_end {
+      return -1.0;
+    }
+  }
+  return -1.0;
+}
+
 // LOD debug color palette (7 levels)
 fn lod_color(level: u32) -> vec3<f32> {
   switch level {
@@ -186,36 +233,54 @@ fn shade_ray(ray_origin: vec3<f32>, ray_dir: vec3<f32>, box_min: vec3<f32>, box_
     return result;
   }
 
-  var t_hit = tmin;
-  if t_hit < 0.0 {
-    t_hit = tmax;
-  }
+  let center = (box_min + box_max) * 0.5;
+  let half = (box_max - box_min) * 0.5;
+  let bevel = uniforms.bevel_radius * half.x; // fraction of half-size
 
-  result.hit = true;
-  result.hit_pos = ray_origin + ray_dir * t_hit;
-
-  // Determine face normal from slab intersection axis
-  let inv_dir = 1.0 / ray_dir;
-  let t1 = (box_min - ray_origin) * inv_dir;
-  let t2 = (box_max - ray_origin) * inv_dir;
-  let tmin_v = min(t1, t2);
-  let tmax_v = max(t1, t2);
-
-  if t_hit == tmin {
-    if tmin_v.x >= tmin_v.y && tmin_v.x >= tmin_v.z {
-      result.normal = vec3<f32>(sign(-ray_dir.x), 0.0, 0.0);
-    } else if tmin_v.y >= tmin_v.z {
-      result.normal = vec3<f32>(0.0, sign(-ray_dir.y), 0.0);
-    } else {
-      result.normal = vec3<f32>(0.0, 0.0, sign(-ray_dir.z));
+  if bevel > 0.0 {
+    // SDF sphere-tracing path for rounded cubes
+    let t_start = max(tmin, 0.0);
+    let t_sdf = trace_round_box(ray_origin, ray_dir, center, half, bevel, t_start, tmax);
+    if t_sdf < 0.0 {
+      return result;
     }
+    result.hit = true;
+    result.hit_pos = ray_origin + ray_dir * t_sdf;
+    let local_p = result.hit_pos - center;
+    result.normal = sd_round_box_normal(local_p, half, bevel);
   } else {
-    if tmax_v.x <= tmax_v.y && tmax_v.x <= tmax_v.z {
-      result.normal = vec3<f32>(sign(ray_dir.x), 0.0, 0.0);
-    } else if tmax_v.y <= tmax_v.z {
-      result.normal = vec3<f32>(0.0, sign(ray_dir.y), 0.0);
+    // Original fast AABB slab path
+    var t_hit = tmin;
+    if t_hit < 0.0 {
+      t_hit = tmax;
+    }
+
+    result.hit = true;
+    result.hit_pos = ray_origin + ray_dir * t_hit;
+
+    // Determine face normal from slab intersection axis
+    let inv_dir = 1.0 / ray_dir;
+    let t1 = (box_min - ray_origin) * inv_dir;
+    let t2 = (box_max - ray_origin) * inv_dir;
+    let tmin_v = min(t1, t2);
+    let tmax_v = max(t1, t2);
+
+    if t_hit == tmin {
+      if tmin_v.x >= tmin_v.y && tmin_v.x >= tmin_v.z {
+        result.normal = vec3<f32>(sign(-ray_dir.x), 0.0, 0.0);
+      } else if tmin_v.y >= tmin_v.z {
+        result.normal = vec3<f32>(0.0, sign(-ray_dir.y), 0.0);
+      } else {
+        result.normal = vec3<f32>(0.0, 0.0, sign(-ray_dir.z));
+      }
     } else {
-      result.normal = vec3<f32>(0.0, 0.0, sign(ray_dir.z));
+      if tmax_v.x <= tmax_v.y && tmax_v.x <= tmax_v.z {
+        result.normal = vec3<f32>(sign(ray_dir.x), 0.0, 0.0);
+      } else if tmax_v.y <= tmax_v.z {
+        result.normal = vec3<f32>(0.0, sign(ray_dir.y), 0.0);
+      } else {
+        result.normal = vec3<f32>(0.0, 0.0, sign(ray_dir.z));
+      }
     }
   }
 

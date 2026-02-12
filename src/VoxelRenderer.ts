@@ -91,6 +91,7 @@ export class VoxelRenderer {
   private debugFlags = 0;
   private subpixelThreshold = 0.8;
   private voxelScaleFactor = 1.0;
+  private bevelRadius = 0.0;
 
   // Cached view-projection matrix for frustum extraction
   private viewProjMatrix = new Float32Array(16);
@@ -605,6 +606,14 @@ export class VoxelRenderer {
     return this.voxelScaleFactor;
   }
 
+  setBevelRadius(radius: number): void {
+    this.bevelRadius = Math.max(0.0, Math.min(0.5, radius));
+  }
+
+  get currentBevelRadius(): number {
+    return this.bevelRadius;
+  }
+
   get drawCallCount(): number {
     return this.lastDrawCallCount;
   }
@@ -730,6 +739,8 @@ export class VoxelRenderer {
     f[44] = jitterY;
     // voxel_scale: offset 45
     f[45] = this.voxelScaleFactor;
+    // bevel_radius: offset 46
+    f[46] = this.bevelRadius;
 
     // Update TAA uniforms if in TAA mode
     if (this.aaMode === AAMode.TAA && this.taaUniformBuffer && this.device) {

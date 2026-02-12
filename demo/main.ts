@@ -379,6 +379,31 @@ async function main() {
   scaleRow.appendChild(scaleVal);
   panel.appendChild(scaleRow);
 
+  // Bevel slider
+  const bevelRow = document.createElement('div');
+  bevelRow.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:2px';
+  const bevelLabel = document.createElement('span');
+  bevelLabel.textContent = 'Bevel';
+  const bevelVal = document.createElement('span');
+  bevelVal.style.cssText = 'margin-left:auto;min-width:28px;text-align:right';
+  bevelVal.textContent = '0%';
+  const bevelSlider = document.createElement('input');
+  bevelSlider.type = 'range';
+  bevelSlider.min = '0';
+  bevelSlider.max = '0.5';
+  bevelSlider.step = '0.01';
+  bevelSlider.value = '0';
+  bevelSlider.style.cssText = 'flex:1;cursor:pointer';
+  bevelSlider.addEventListener('input', () => {
+    const v = Number(bevelSlider.value);
+    renderer.setBevelRadius(v);
+    bevelVal.textContent = `${Math.round(v * 200)}%`;
+  });
+  bevelRow.appendChild(bevelLabel);
+  bevelRow.appendChild(bevelSlider);
+  bevelRow.appendChild(bevelVal);
+  panel.appendChild(bevelRow);
+
   // Separator
   const sep2 = document.createElement('hr');
   sep2.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';
