@@ -13,6 +13,7 @@ struct Uniforms {
   aa_mode:        u32,           // 168
   jitter_x:       f32,           // 172
   jitter_y:       f32,           // 176
+  voxel_scale:    f32,           // 180
 };
 
 struct ChunkUniforms {
@@ -83,7 +84,7 @@ fn vs_main(
 
   // Reconstruct center/half/color for fragment shader ray-AABB
   let center = mix(voxel.pos_a.xyz, voxel.pos_b.xyz, t) + chunk.rte_offset;
-  let half_size = mix(voxel.size_a, voxel.size_b, t) * 0.5;
+  let half_size = mix(voxel.size_a, voxel.size_b, t) * uniforms.voxel_scale * 0.5;
   let color_a = unpack_color(voxel.color_a);
   let color_b = unpack_color(voxel.color_b);
   let color = mix(color_a, color_b, uniforms.color_t);

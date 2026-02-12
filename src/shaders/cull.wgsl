@@ -12,6 +12,7 @@ struct CullUniforms {
   chunk_index:    u32,           // 196
   subpixel_threshold: f32,      // 200
   aa_mode:            u32,      // 204
+  voxel_scale:        f32,      // 208
 };
 
 struct Voxel {
@@ -56,7 +57,7 @@ fn cull_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // Interpolate position and size, apply RTE offset
   let center = mix(voxel.pos_a.xyz, voxel.pos_b.xyz, t) + cull.rte_offset;
-  let half_size = mix(voxel.size_a, voxel.size_b, t) * 0.5;
+  let half_size = mix(voxel.size_a, voxel.size_b, t) * cull.voxel_scale * 0.5;
   let half = vec3<f32>(half_size, half_size, half_size);
 
   // Frustum-sphere culling (conservative: use bounding sphere)

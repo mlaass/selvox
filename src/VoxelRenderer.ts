@@ -90,6 +90,7 @@ export class VoxelRenderer {
   private colorInterpolation = 0;
   private debugFlags = 0;
   private subpixelThreshold = 0.8;
+  private voxelScaleFactor = 1.0;
 
   // Cached view-projection matrix for frustum extraction
   private viewProjMatrix = new Float32Array(16);
@@ -596,6 +597,14 @@ export class VoxelRenderer {
     return this.subpixelThreshold;
   }
 
+  setVoxelScale(factor: number): void {
+    this.voxelScaleFactor = Math.max(0.5, Math.min(1.0, factor));
+  }
+
+  get currentVoxelScale(): number {
+    return this.voxelScaleFactor;
+  }
+
   get drawCallCount(): number {
     return this.lastDrawCallCount;
   }
@@ -719,6 +728,8 @@ export class VoxelRenderer {
     // jitter_x: offset 43, jitter_y: offset 44
     f[43] = jitterX;
     f[44] = jitterY;
+    // voxel_scale: offset 45
+    f[45] = this.voxelScaleFactor;
 
     // Update TAA uniforms if in TAA mode
     if (this.aaMode === AAMode.TAA && this.taaUniformBuffer && this.device) {
@@ -849,6 +860,9 @@ export class VoxelRenderer {
 
       // aa_mode: u32 at offset 204
       cullDv.setUint32(cullOffset + 204, this.aaMode, true);
+
+      // voxel_scale: f32 at offset 208
+      cullDv.setFloat32(cullOffset + 208, this.voxelScaleFactor, true);
 
       // Clear indirect args for this chunk: vertex_count=6, instance_count=0, first_vertex=0, first_instance=start_slot
       const argsOffset = chunkInfo.chunkIndex * INDIRECT_ARGS_STRIDE;

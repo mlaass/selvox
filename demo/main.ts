@@ -354,6 +354,31 @@ async function main() {
   cullRow.appendChild(cullVal);
   panel.appendChild(cullRow);
 
+  // Scale slider
+  const scaleRow = document.createElement('div');
+  scaleRow.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:2px';
+  const scaleLabel = document.createElement('span');
+  scaleLabel.textContent = 'Scale';
+  const scaleVal = document.createElement('span');
+  scaleVal.style.cssText = 'margin-left:auto;min-width:28px;text-align:right';
+  scaleVal.textContent = '100%';
+  const scaleSlider = document.createElement('input');
+  scaleSlider.type = 'range';
+  scaleSlider.min = '0.5';
+  scaleSlider.max = '1.0';
+  scaleSlider.step = '0.01';
+  scaleSlider.value = '1.0';
+  scaleSlider.style.cssText = 'flex:1;cursor:pointer';
+  scaleSlider.addEventListener('input', () => {
+    const v = Number(scaleSlider.value);
+    renderer.setVoxelScale(v);
+    scaleVal.textContent = `${Math.round(v * 100)}%`;
+  });
+  scaleRow.appendChild(scaleLabel);
+  scaleRow.appendChild(scaleSlider);
+  scaleRow.appendChild(scaleVal);
+  panel.appendChild(scaleRow);
+
   // Separator
   const sep2 = document.createElement('hr');
   sep2.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';
