@@ -330,6 +330,30 @@ async function main() {
   speedRow.appendChild(speedVal);
   panel.appendChild(speedRow);
 
+  // Cull px slider
+  const cullRow = document.createElement('div');
+  cullRow.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:2px';
+  const cullLabel = document.createElement('span');
+  cullLabel.textContent = 'Cull px';
+  const cullVal = document.createElement('span');
+  cullVal.style.cssText = 'margin-left:auto;min-width:28px;text-align:right';
+  cullVal.textContent = String(renderer.currentSubpixelThreshold);
+  const cullSlider = document.createElement('input');
+  cullSlider.type = 'range';
+  cullSlider.min = '0.1';
+  cullSlider.max = '4.0';
+  cullSlider.step = '0.1';
+  cullSlider.value = String(renderer.currentSubpixelThreshold);
+  cullSlider.style.cssText = 'flex:1;cursor:pointer';
+  cullSlider.addEventListener('input', () => {
+    renderer.setSubpixelThreshold(Number(cullSlider.value));
+    cullVal.textContent = Number(cullSlider.value).toFixed(1);
+  });
+  cullRow.appendChild(cullLabel);
+  cullRow.appendChild(cullSlider);
+  cullRow.appendChild(cullVal);
+  panel.appendChild(cullRow);
+
   // Separator
   const sep2 = document.createElement('hr');
   sep2.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';

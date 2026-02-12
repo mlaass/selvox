@@ -152,6 +152,77 @@ fn lod_color(level: u32) -> vec3<f32> {
   }
 }
 
+struct ShadeResult {
+  color: vec3<f32>,
+  depth: f32,
+  hit: bool,
+  hit_pos: vec3<f32>,
+  normal: vec3<f32>,
+};
+
+fn shade_ray(ray_origin: vec3<f32>, ray_dir: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>, base_color: vec3<f32>) -> ShadeResult {
+  var result: ShadeResult;
+  result.hit = false;
+  result.color = vec3<f32>(0.0);
+  result.depth = 1.0;
+  result.hit_pos = vec3<f32>(0.0);
+  result.normal = vec3<f32>(0.0, 1.0, 0.0);
+
+  let t = ray_aabb(ray_origin, ray_dir, box_min, box_max);
+  let tmin = t.x;
+  let tmax = t.y;
+
+  if tmin > tmax || tmax < 0.0 {
+    return result;
+  }
+
+  var t_hit = tmin;
+  if t_hit < 0.0 {
+    t_hit = tmax;
+  }
+
+  result.hit = true;
+  result.hit_pos = ray_origin + ray_dir * t_hit;
+
+  // Determine face normal from slab intersection axis
+  let inv_dir = 1.0 / ray_dir;
+  let t1 = (box_min - ray_origin) * inv_dir;
+  let t2 = (box_max - ray_origin) * inv_dir;
+  let tmin_v = min(t1, t2);
+  let tmax_v = max(t1, t2);
+
+  if t_hit == tmin {
+    if tmin_v.x >= tmin_v.y && tmin_v.x >= tmin_v.z {
+      result.normal = vec3<f32>(sign(-ray_dir.x), 0.0, 0.0);
+    } else if tmin_v.y >= tmin_v.z {
+      result.normal = vec3<f32>(0.0, sign(-ray_dir.y), 0.0);
+    } else {
+      result.normal = vec3<f32>(0.0, 0.0, sign(-ray_dir.z));
+    }
+  } else {
+    if tmax_v.x <= tmax_v.y && tmax_v.x <= tmax_v.z {
+      result.normal = vec3<f32>(sign(ray_dir.x), 0.0, 0.0);
+    } else if tmax_v.y <= tmax_v.z {
+      result.normal = vec3<f32>(0.0, sign(ray_dir.y), 0.0);
+    } else {
+      result.normal = vec3<f32>(0.0, 0.0, sign(ray_dir.z));
+    }
+  }
+
+  // Lighting
+  let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
+  let ndotl = max(dot(result.normal, light_dir), 0.0);
+  let ambient = 0.15;
+  let diffuse = 0.85 * ndotl;
+  result.color = base_color * (ambient + diffuse);
+
+  // Depth
+  let hit_clip = uniforms.view_proj * vec4<f32>(result.hit_pos, 1.0);
+  result.depth = hit_clip.z / hit_clip.w;
+
+  return result;
+}
+
 struct FragOutput {
   @location(0) color: vec4<f32>,
   @builtin(frag_depth) depth: f32,
@@ -162,47 +233,53 @@ fn fs_main(in: VertexOutput) -> FragOutput {
   let box_min = in.box_center - in.box_half;
   let box_max = in.box_center + in.box_half;
 
-  let t = ray_aabb(in.ray_origin, in.ray_dir, box_min, box_max);
-  let tmin = t.x;
-  let tmax = t.y;
+  // Compute ray direction derivatives for supersampling (must be in uniform control flow)
+  let ddx_dir = dpdx(in.ray_dir);
+  let ddy_dir = dpdy(in.ray_dir);
 
-  if tmin > tmax || tmax < 0.0 {
+  // Center ray
+  let center = shade_ray(in.ray_origin, in.ray_dir, box_min, box_max, in.color);
+  if !center.hit {
     discard;
   }
 
-  // Use the closer positive hit
-  var t_hit = tmin;
-  if t_hit < 0.0 {
-    t_hit = tmax;
+  var lit_color = center.color;
+
+  // Edge detection: check if hit is near a cube edge (two face boundaries)
+  let abs_rel = abs((center.hit_pos - in.box_center) / in.box_half);
+  let mx = max(abs_rel.x, max(abs_rel.y, abs_rel.z));
+  let mn = min(abs_rel.x, min(abs_rel.y, abs_rel.z));
+  let mid = abs_rel.x + abs_rel.y + abs_rel.z - mx - mn;
+
+  if mid > 0.92 {
+    // RGSS 4x sub-pixel rays
+    let d0 = in.ray_dir + ddx_dir * -0.125 + ddy_dir * -0.375;
+    let d1 = in.ray_dir + ddx_dir *  0.375 + ddy_dir * -0.125;
+    let d2 = in.ray_dir + ddx_dir * -0.375 + ddy_dir *  0.125;
+    let d3 = in.ray_dir + ddx_dir *  0.125 + ddy_dir *  0.375;
+
+    let s0 = shade_ray(in.ray_origin, d0, box_min, box_max, in.color);
+    let s1 = shade_ray(in.ray_origin, d1, box_min, box_max, in.color);
+    let s2 = shade_ray(in.ray_origin, d2, box_min, box_max, in.color);
+    let s3 = shade_ray(in.ray_origin, d3, box_min, box_max, in.color);
+
+    var sum = vec3<f32>(0.0);
+    var count = 0.0;
+    if s0.hit { sum += s0.color; count += 1.0; }
+    if s1.hit { sum += s1.color; count += 1.0; }
+    if s2.hit { sum += s2.color; count += 1.0; }
+    if s3.hit { sum += s3.color; count += 1.0; }
+    if count > 0.0 {
+      lit_color = sum / count;
+    }
   }
-
-  let hit_pos = in.ray_origin + in.ray_dir * t_hit;
-  let hit_clip = uniforms.view_proj * vec4<f32>(hit_pos, 1.0);
-  let frag_depth = hit_clip.z / hit_clip.w;
-
-  // Compute face normal from the hit position relative to box center
-  let rel = (hit_pos - in.box_center) / in.box_half;
-  let abs_rel = abs(rel);
-  var normal: vec3<f32>;
-  if abs_rel.x > abs_rel.y && abs_rel.x > abs_rel.z {
-    normal = vec3<f32>(sign(rel.x), 0.0, 0.0);
-  } else if abs_rel.y > abs_rel.z {
-    normal = vec3<f32>(0.0, sign(rel.y), 0.0);
-  } else {
-    normal = vec3<f32>(0.0, 0.0, sign(rel.z));
-  }
-
-  // Simple directional lighting
-  let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
-  let ndotl = max(dot(normal, light_dir), 0.0);
-  let ambient = 0.15;
-  let diffuse = 0.85 * ndotl;
-  var lit_color = in.color * (ambient + diffuse);
 
   // LOD debug visualization: blend with LOD palette color when bit 0 set
   if (uniforms.debug_flags & 1u) != 0u {
     let lod_col = lod_color(in.lod_level);
-    lit_color = mix(lit_color, lod_col * (ambient + diffuse), 0.6);
+    let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
+    let ndotl = max(dot(center.normal, light_dir), 0.0);
+    lit_color = mix(lit_color, lod_col * (0.15 + 0.85 * ndotl), 0.6);
   }
 
   // Billboard quad edge debug: yellow outline (bit 1)
@@ -231,19 +308,19 @@ fn fs_main(in: VertexOutput) -> FragOutput {
 
   // Normals debug: ±XYZ → RGB (bit 3)
   if (uniforms.debug_flags & 8u) != 0u {
-    lit_color = normal * 0.5 + 0.5;
+    lit_color = center.normal * 0.5 + 0.5;
   }
 
   // Depth debug: log-scale depth → grayscale (bit 4)
   if (uniforms.debug_flags & 16u) != 0u {
     let linear_z = uniforms.near * uniforms.far /
-      (uniforms.far - frag_depth * (uniforms.far - uniforms.near));
+      (uniforms.far - center.depth * (uniforms.far - uniforms.near));
     let norm_depth = log2(linear_z / uniforms.near) / log2(uniforms.far / uniforms.near);
     lit_color = vec3<f32>(saturate(norm_depth));
   }
 
   var out: FragOutput;
   out.color = vec4<f32>(lit_color, 1.0);
-  out.depth = frag_depth;
+  out.depth = center.depth;
   return out;
 }

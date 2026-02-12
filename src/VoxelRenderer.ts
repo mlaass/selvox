@@ -52,6 +52,7 @@ export class VoxelRenderer {
   private interpolation = 0;
   private colorInterpolation = 0;
   private debugFlags = 0;
+  private subpixelThreshold = 0.8;
 
   // Cached view-projection matrix for frustum extraction
   private viewProjMatrix = new Float32Array(16);
@@ -139,7 +140,7 @@ export class VoxelRenderer {
       fragment: {
         module: shaderModule,
         entryPoint: 'fs_main',
-        targets: [{ format }],
+        targets: [{ format: this.format }],
       },
       primitive: {
         topology: 'triangle-list',
@@ -415,6 +416,14 @@ export class VoxelRenderer {
     return this.debugFlags;
   }
 
+  setSubpixelThreshold(value: number): void {
+    this.subpixelThreshold = value;
+  }
+
+  get currentSubpixelThreshold(): number {
+    return this.subpixelThreshold;
+  }
+
   get drawCallCount(): number {
     return this.lastDrawCallCount;
   }
@@ -576,6 +585,9 @@ export class VoxelRenderer {
       // chunk_index: u32 at offset 196
       cullDv.setUint32(cullOffset + 196, chunkInfo.chunkIndex, true);
 
+      // subpixel_threshold: f32 at offset 200
+      cullDv.setFloat32(cullOffset + 200, this.subpixelThreshold, true);
+
       // Clear indirect args for this chunk: vertex_count=6, instance_count=0, first_vertex=0, first_instance=start_slot
       const argsOffset = chunkInfo.chunkIndex * INDIRECT_ARGS_STRIDE;
       clearData.setUint32(argsOffset, 6, true);       // vertex_count
@@ -605,22 +617,20 @@ export class VoxelRenderer {
     });
 
     // --- Render pass ---
-    const textureView = this.context.getCurrentTexture().createView();
-
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
-          view: textureView,
+          view: this.context.getCurrentTexture().createView(),
           clearValue: { r: 0.05, g: 0.05, b: 0.08, a: 1.0 },
-          loadOp: 'clear',
-          storeOp: 'store',
+          loadOp: 'clear' as const,
+          storeOp: 'store' as const,
         },
       ],
       depthStencilAttachment: {
         view: this.depthTextureView,
         depthClearValue: 1.0,
         depthLoadOp: 'clear',
-        depthStoreOp: 'store',
+        depthStoreOp: 'discard',
       },
     });
 

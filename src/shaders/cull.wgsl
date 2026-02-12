@@ -10,6 +10,7 @@ struct CullUniforms {
   lod_level:      u32,           // 188
   start_slot:     u32,           // 192
   chunk_index:    u32,           // 196
+  subpixel_threshold: f32,      // 200
 };
 
 struct Voxel {
@@ -105,22 +106,24 @@ fn cull_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     min_depth = 0.0;
   }
 
-  // Pad slightly to avoid clipping at edges
-  let pad = vec2<f32>(2.0 / cull.viewport_size.x, 2.0 / cull.viewport_size.y);
+  // Subpixel culling — smooth probabilistic falloff
+  let screen_size = (ndc_max - ndc_min) * cull.viewport_size * 0.5;
+  let screen_area_raw = screen_size.x * screen_size.y;
+  // Quantize to 1/16 px² steps to absorb GPU FP non-determinism across frames
+  let screen_area = floor(screen_area_raw * 16.0) / 16.0;
+  // Smooth keep-probability: 1.0 when screen_area >= threshold, ramps to 0 below
+  let keep_prob = clamp(screen_area / cull.subpixel_threshold, 0.0, 1.0);
+  let hash = (local_id * 2654435761u) & 0xFFFFu;
+  if f32(hash) / 65535.0 >= keep_prob {
+    return;
+  }
+
+  // Pad billboard edges — only for large close-up voxels where edge clipping is visible
+  let min_dim = min(screen_size.x, screen_size.y);
+  let pad_scale = saturate((min_dim - 40.0) / 20.0);
+  let pad = vec2<f32>(2.0 / cull.viewport_size.x, 2.0 / cull.viewport_size.y) * pad_scale;
   ndc_min = ndc_min - pad;
   ndc_max = ndc_max + pad;
-
-  // Subpixel culling (Majercik 2018, Listing 3)
-  let screen_size = (ndc_max - ndc_min) * cull.viewport_size * 0.5;
-  let screen_area = screen_size.x * screen_size.y;
-
-  if screen_area < 0.8 {
-    let hash = (local_id * 2654435761u) & 0xFFFFu;
-    let threshold = screen_area / 0.8;
-    if f32(hash) / 65535.0 > threshold {
-      return;
-    }
-  }
 
   // Clamp to clip space
   ndc_min = clamp(ndc_min, vec2<f32>(-1.0), vec2<f32>(1.0));
