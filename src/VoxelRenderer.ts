@@ -42,6 +42,13 @@ export class VoxelRenderer {
   private depthTexture: GPUTexture | null = null;
   private depthTextureView: GPUTextureView | null = null;
 
+  // MSAA alpha-to-coverage state
+  private pipelineMSAA: GPURenderPipeline | null = null;
+  private msaaColorTexture: GPUTexture | null = null;
+  private msaaColorTextureView: GPUTextureView | null = null;
+  private msaaDepthTexture: GPUTexture | null = null;
+  private msaaDepthTextureView: GPUTextureView | null = null;
+
   // Compute culling pipeline state
   private cullPipeline: GPUComputePipeline | null = null;
   private cullBindGroupLayout: GPUBindGroupLayout | null = null;
@@ -214,6 +221,33 @@ export class VoxelRenderer {
       primitive: {
         topology: 'triangle-list',
         cullMode: 'none',
+      },
+      depthStencil: {
+        format: 'depth32float',
+        depthWriteEnabled: true,
+        depthCompare: 'less',
+      },
+    });
+
+    // Pipeline variant for MSAA 4x alpha-to-coverage (mode 4)
+    this.pipelineMSAA = device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: {
+        module: shaderModule,
+        entryPoint: 'vs_main',
+      },
+      fragment: {
+        module: shaderModule,
+        entryPoint: 'fs_main',
+        targets: [{ format: this.format! }],
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'none',
+      },
+      multisample: {
+        count: 4,
+        alphaToCoverageEnabled: true,
       },
       depthStencil: {
         format: 'depth32float',
@@ -466,6 +500,8 @@ export class VoxelRenderer {
     this.taaHistory[0]?.destroy();
     this.taaHistory[1]?.destroy();
     this.postProcessOutput?.destroy();
+    this.msaaColorTexture?.destroy();
+    this.msaaDepthTexture?.destroy();
 
     // Depth texture — depth32float for post-process readability
     this.depthTexture = this.device.createTexture({
@@ -500,6 +536,30 @@ export class VoxelRenderer {
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.postProcessOutputView = this.postProcessOutput.createView();
+
+    // MSAA textures for alpha-to-coverage mode
+    if (this.aaMode === AAMode.MSAA_Alpha) {
+      this.msaaColorTexture = this.device.createTexture({
+        size: [width, height],
+        format: this.format!,
+        sampleCount: 4,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      this.msaaColorTextureView = this.msaaColorTexture.createView();
+
+      this.msaaDepthTexture = this.device.createTexture({
+        size: [width, height],
+        format: 'depth32float',
+        sampleCount: 4,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      this.msaaDepthTextureView = this.msaaDepthTexture.createView();
+    } else {
+      this.msaaColorTexture = null;
+      this.msaaColorTextureView = null;
+      this.msaaDepthTexture = null;
+      this.msaaDepthTextureView = null;
+    }
 
     // Reset TAA history on resize
     this.hasPrevViewProj = false;
@@ -660,6 +720,8 @@ export class VoxelRenderer {
       this.hasPrevViewProj = false;
       this.taaHistoryIndex = 0;
       this.frameCount = 0;
+      // Recreate render targets (MSAA textures depend on mode)
+      this.createRenderTargets(this.canvas.width, this.canvas.height);
     }
   }
 
@@ -834,6 +896,7 @@ export class VoxelRenderer {
     ) return;
 
     const device = this.device;
+    const useMSAA = this.aaMode === AAMode.MSAA_Alpha;
     const usePostProcess = this.aaMode === AAMode.TAA || this.aaMode === AAMode.Bilateral;
 
     // Write global uniforms
@@ -944,28 +1007,46 @@ export class VoxelRenderer {
     });
 
     // --- Render pass ---
-    const colorTarget = usePostProcess
-      ? this.intermediateColorView!
-      : this.context.getCurrentTexture().createView();
+    let pass: GPURenderPassEncoder;
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
+    if (useMSAA && this.msaaColorTextureView && this.msaaDepthTextureView) {
+      pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.msaaColorTextureView,
+          resolveTarget: this.context.getCurrentTexture().createView(),
+          clearValue: { r: 0.05, g: 0.05, b: 0.08, a: 1.0 },
+          loadOp: 'clear' as const,
+          storeOp: 'discard' as const,
+        }],
+        depthStencilAttachment: {
+          view: this.msaaDepthTextureView,
+          depthClearValue: 1.0,
+          depthLoadOp: 'clear',
+          depthStoreOp: 'discard',
+        },
+      });
+      pass.setPipeline(this.pipelineMSAA!);
+    } else {
+      const colorTarget = usePostProcess
+        ? this.intermediateColorView!
+        : this.context.getCurrentTexture().createView();
+
+      pass = encoder.beginRenderPass({
+        colorAttachments: [{
           view: colorTarget,
           clearValue: { r: 0.05, g: 0.05, b: 0.08, a: 1.0 },
           loadOp: 'clear' as const,
           storeOp: 'store' as const,
+        }],
+        depthStencilAttachment: {
+          view: this.depthTextureView!,
+          depthClearValue: 1.0,
+          depthLoadOp: 'clear',
+          depthStoreOp: usePostProcess ? 'store' : 'discard',
         },
-      ],
-      depthStencilAttachment: {
-        view: this.depthTextureView,
-        depthClearValue: 1.0,
-        depthLoadOp: 'clear',
-        depthStoreOp: usePostProcess ? 'store' : 'discard',
-      },
-    });
-
-    pass.setPipeline(usePostProcess ? this.pipelineIntermediate : this.pipeline);
+      });
+      pass.setPipeline(usePostProcess ? this.pipelineIntermediate! : this.pipeline!);
+    }
     pass.setBindGroup(0, this.bindGroup);
 
     let drawCalls = 0;
@@ -1127,6 +1208,8 @@ export class VoxelRenderer {
     this.taaHistory[0]?.destroy();
     this.taaHistory[1]?.destroy();
     this.postProcessOutput?.destroy();
+    this.msaaColorTexture?.destroy();
+    this.msaaDepthTexture?.destroy();
     this.pool?.dispose();
     this.uniformBuffer?.destroy();
     this.chunkUniformBuffer?.destroy();
@@ -1156,8 +1239,13 @@ export class VoxelRenderer {
     this.taaUniformBuffer = null;
     this.bilateralUniformBuffer = null;
     this.casUniformBuffer = null;
+    this.msaaColorTexture = null;
+    this.msaaColorTextureView = null;
+    this.msaaDepthTexture = null;
+    this.msaaDepthTextureView = null;
     this.pipeline = null;
     this.pipelineIntermediate = null;
+    this.pipelineMSAA = null;
     this.bindGroup = null;
     this.chunkBindGroup = null;
     this.cullBindGroup = null;

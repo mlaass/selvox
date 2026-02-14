@@ -3,6 +3,7 @@ export const enum AAMode {
   DistanceSS = 1,
   TAA = 2,
   Bilateral = 3,
+  MSAA_Alpha = 4,
 }
 
 export interface RendererOptions {

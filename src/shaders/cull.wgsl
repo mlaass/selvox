@@ -128,7 +128,7 @@ fn cull_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   ndc_max = ndc_max + pad;
 
   // TAA: ensure at least 1px billboard padding for sub-pixel jitter coverage
-  if cull.aa_mode == 2u {
+  if cull.aa_mode == 2u || cull.aa_mode == 4u {
     let taa_pad = vec2<f32>(2.0 / cull.viewport_size.x, 2.0 / cull.viewport_size.y);
     ndc_min = ndc_min - taa_pad;
     ndc_max = ndc_max + taa_pad;

@@ -367,6 +367,35 @@ fn fs_main(in: VertexOutput) -> FragOutput {
     }
   }
 
+  // MSAA Alpha mode (mode 4): RGSS hit-count coverage for alpha-to-coverage
+  var final_alpha = 1.0;
+  if uniforms.aa_mode == 4u {
+    let d0 = in.ray_dir + ddx_dir * -0.125 + ddy_dir * -0.375;
+    let d1 = in.ray_dir + ddx_dir *  0.375 + ddy_dir * -0.125;
+    let d2 = in.ray_dir + ddx_dir * -0.375 + ddy_dir *  0.125;
+    let d3 = in.ray_dir + ddx_dir *  0.125 + ddy_dir *  0.375;
+
+    var hits = 0.0;
+    let t0 = ray_aabb(in.ray_origin, d0, box_min, box_max);
+    if t0.x <= t0.y && t0.y >= 0.0 { hits += 1.0; }
+    let t1 = ray_aabb(in.ray_origin, d1, box_min, box_max);
+    if t1.x <= t1.y && t1.y >= 0.0 { hits += 1.0; }
+    let t2 = ray_aabb(in.ray_origin, d2, box_min, box_max);
+    if t2.x <= t2.y && t2.y >= 0.0 { hits += 1.0; }
+    let t3 = ray_aabb(in.ray_origin, d3, box_min, box_max);
+    if t3.x <= t3.y && t3.y >= 0.0 { hits += 1.0; }
+
+    final_alpha = hits / 4.0;
+
+    // Per-voxel alpha dither to decorrelate coverage masks at shared boundaries
+    // Without this, adjacent voxels with identical alpha get identical MSAA coverage
+    // masks, leaving uncovered samples that bleed background color (dark contour lines)
+    if hits < 4.0 {
+      let vh = fract(sin(dot(in.box_center, vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
+      final_alpha = saturate(final_alpha + (vh - 0.5) * 0.25);
+    }
+  }
+
   // LOD debug visualization: blend with LOD palette color when bit 0 set
   if (uniforms.debug_flags & 1u) != 0u {
     let lod_col = lod_color(in.lod_level);
@@ -413,7 +442,7 @@ fn fs_main(in: VertexOutput) -> FragOutput {
   }
 
   var out: FragOutput;
-  out.color = vec4<f32>(lit_color, 1.0);
+  out.color = vec4<f32>(lit_color, final_alpha);
   out.depth = center.depth;
   return out;
 }

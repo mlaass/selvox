@@ -416,7 +416,7 @@ async function main() {
   aaLabel.textContent = 'AA';
   const aaSelect = document.createElement('select');
   aaSelect.style.cssText = 'flex:1;cursor:pointer;background:#333;color:#ccc;border:1px solid #555;border-radius:2px;font:11px monospace;padding:1px 2px';
-  const aaNames = ['None', 'Dist. Adaptive SS', 'TAA', 'Bilateral Filter'];
+  const aaNames = ['None', 'Dist. Adaptive SS', 'TAA', 'Bilateral Filter', 'MSAA Alpha'];
   aaNames.forEach((name, i) => {
     const opt = document.createElement('option');
     opt.value = String(i);
