@@ -439,10 +439,15 @@ async function main() {
   aaLabel.textContent = 'AA';
   const aaSelect = document.createElement('select');
   aaSelect.style.cssText = 'flex:1;cursor:pointer;background:#333;color:#ccc;border:1px solid #555;border-radius:2px;font:11px monospace;padding:1px 2px';
-  const aaNames = ['None', 'Dist. Adaptive SS', 'TAA', 'Bilateral Filter', 'MSAA Alpha'];
-  aaNames.forEach((name, i) => {
+  const aaNames: [string, AAMode][] = [
+    ['None', AAMode.None],
+    ['Dist. Adaptive SS', AAMode.DistanceSS],
+    ['Bilateral Filter', AAMode.Bilateral],
+    ['SDF Coverage', AAMode.MSAA_Alpha],
+  ];
+  aaNames.forEach(([name, mode]) => {
     const opt = document.createElement('option');
-    opt.value = String(i);
+    opt.value = String(mode);
     opt.textContent = name;
     aaSelect.appendChild(opt);
   });
@@ -452,31 +457,6 @@ async function main() {
   aaRow.appendChild(aaLabel);
   aaRow.appendChild(aaSelect);
   panel.appendChild(aaRow);
-
-  // CAS Sharpness slider
-  const sharpRow = document.createElement('div');
-  sharpRow.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:2px';
-  const sharpLabel = document.createElement('span');
-  sharpLabel.textContent = 'Sharp';
-  const sharpVal = document.createElement('span');
-  sharpVal.style.cssText = 'margin-left:auto;min-width:28px;text-align:right';
-  sharpVal.textContent = '0.50';
-  const sharpSlider = document.createElement('input');
-  sharpSlider.type = 'range';
-  sharpSlider.min = '0';
-  sharpSlider.max = '1';
-  sharpSlider.step = '0.05';
-  sharpSlider.value = '0.5';
-  sharpSlider.style.cssText = 'flex:1;cursor:pointer';
-  sharpSlider.addEventListener('input', () => {
-    const v = Number(sharpSlider.value);
-    renderer.setCASSharpness(v);
-    sharpVal.textContent = v.toFixed(2);
-  });
-  sharpRow.appendChild(sharpLabel);
-  sharpRow.appendChild(sharpSlider);
-  sharpRow.appendChild(sharpVal);
-  panel.appendChild(sharpRow);
 
   // Separator
   const sep3 = document.createElement('hr');

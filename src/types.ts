@@ -1,8 +1,7 @@
 export const enum AAMode {
   None = 0,
   DistanceSS = 1,
-  TAA = 2,
-  Bilateral = 3,
+  Bilateral = 2,
   MSAA_Alpha = 4,
 }
 

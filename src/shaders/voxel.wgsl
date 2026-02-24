@@ -120,13 +120,7 @@ fn vs_main(
   let ray_dir = p_far - p_near;
 
   var out: VertexOutput;
-  // TAA: offset rasterization position by jitter (shifts which pixel the fragment maps to)
-  // Ray reconstruction above uses unjittered ndc_pos + unjittered inv_VP → stable rays
-  var pos_ndc = ndc_pos;
-  if uniforms.aa_mode == 2u {
-    pos_ndc = ndc_pos + vec2<f32>(uniforms.jitter_x, uniforms.jitter_y);
-  }
-  out.position = vec4<f32>(pos_ndc, min_depth, 1.0);
+  out.position = vec4<f32>(ndc_pos, min_depth, 1.0);
   out.ray_origin = uniforms.camera_pos;
   out.ray_dir = ray_dir;
   out.box_center = center;
@@ -312,6 +306,110 @@ fn fs_main(in: VertexOutput) -> FragOutput {
   let ddx_dir = dpdx(in.ray_dir);
   let ddy_dir = dpdy(in.ray_dir);
 
+  // Mode 4: SDF cone coverage — analytical pixel-footprint coverage via box SDF
+  if uniforms.aa_mode == 4u {
+    // Pixel angular size from ray derivatives (world-space displacement per pixel per unit t)
+    let pixel_size = (length(ddx_dir) + length(ddy_dir)) * 0.5;
+
+    // Closest point on ray to box center (parameterized on non-unit ray_dir)
+    let t_center = max(dot(in.box_center - in.ray_origin, in.ray_dir) / dot(in.ray_dir, in.ray_dir), 0.0);
+    let p = in.ray_origin + in.ray_dir * t_center;
+    let local_p = p - in.box_center;
+
+    // SDF: negative inside box, positive outside, zero on surface
+    let bevel = uniforms.bevel_radius * in.box_half.x;
+    let sdf = sd_round_box(local_p, in.box_half, bevel);
+
+    // Cone radius = half-pixel footprint in world space at this distance
+    let cone_r = max(pixel_size * t_center * 0.5, 0.0001);
+
+    // Coverage: smooth transition over 1 pixel width
+    let coverage = 1.0 - smoothstep(-cone_r, cone_r, sdf);
+
+    // Try center ray for shading — must happen before discard
+    let center_hit = shade_ray(in.ray_origin, in.ray_dir, box_min, box_max, in.color);
+
+    // Only discard if center ray missed AND SDF says no coverage
+    if !center_hit.hit && coverage < 0.01 {
+      discard;
+    }
+
+    // If center ray hit, force full coverage — SDF coverage only for near-misses
+    var final_coverage = select(coverage, 1.0, center_hit.hit);
+
+    // Per-voxel dither to decorrelate MSAA coverage masks at shared boundaries
+    if final_coverage < 0.99 {
+      let vh = fract(sin(dot(in.box_center, vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
+      final_coverage = saturate(final_coverage + (vh - 0.5) * 0.25);
+    }
+
+    var lit_color: vec3<f32>;
+    var depth: f32;
+    var repr_normal: vec3<f32>;
+    var repr_hit_pos: vec3<f32>;
+
+    if center_hit.hit {
+      lit_color = center_hit.color;
+      depth = center_hit.depth;
+      repr_normal = center_hit.normal;
+      repr_hit_pos = center_hit.hit_pos;
+    } else {
+      // Center ray missed but pixel has partial coverage — shade from nearest surface point
+      let normal = sd_round_box_normal(local_p, in.box_half, bevel);
+      let surface_p = p - normal * sdf;
+      let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
+      let ndotl = max(dot(normal, light_dir), 0.0);
+      lit_color = in.color * (0.15 + 0.85 * ndotl);
+      let clip = uniforms.view_proj * vec4<f32>(surface_p, 1.0);
+      depth = clip.z / clip.w;
+      repr_normal = normal;
+      repr_hit_pos = surface_p;
+    }
+
+    // Debug overlays
+    if (uniforms.debug_flags & 1u) != 0u {
+      let lod_col = lod_color(in.lod_level);
+      let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
+      let ndotl = max(dot(repr_normal, light_dir), 0.0);
+      lit_color = mix(lit_color, lod_col * (0.15 + 0.85 * ndotl), 0.6);
+    }
+    if (uniforms.debug_flags & 2u) != 0u {
+      let uv_rate = fwidth(in.quad_uv);
+      let edge_px = 1.5;
+      let edge_mask = step(in.quad_uv, uv_rate * edge_px) + step(1.0 - in.quad_uv, uv_rate * edge_px);
+      if max(edge_mask.x, edge_mask.y) > 0.0 {
+        lit_color = vec3<f32>(1.0, 1.0, 0.0);
+      }
+    }
+    if (uniforms.debug_flags & 4u) != 0u {
+      let abs_rel = abs((repr_hit_pos - in.box_center) / in.box_half);
+      let edge_threshold = 0.03;
+      let near_edge = vec3<f32>(
+        step(1.0 - edge_threshold, abs_rel.x),
+        step(1.0 - edge_threshold, abs_rel.y),
+        step(1.0 - edge_threshold, abs_rel.z),
+      );
+      let edge_count = near_edge.x + near_edge.y + near_edge.z;
+      if edge_count >= 2.0 {
+        lit_color = vec3<f32>(0.0, 1.0, 1.0);
+      }
+    }
+    if (uniforms.debug_flags & 8u) != 0u {
+      lit_color = repr_normal * 0.5 + 0.5;
+    }
+    if (uniforms.debug_flags & 16u) != 0u {
+      let linear_z = uniforms.near * uniforms.far /
+        (uniforms.far - depth * (uniforms.far - uniforms.near));
+      let norm_depth = log2(linear_z / uniforms.near) / log2(uniforms.far / uniforms.near);
+      lit_color = vec3<f32>(saturate(norm_depth));
+    }
+
+    var out: FragOutput;
+    out.color = vec4<f32>(lit_color, final_coverage);
+    out.depth = depth;
+    return out;
+  }
+
   // Center ray
   let center = shade_ray(in.ray_origin, in.ray_dir, box_min, box_max, in.color);
   if !center.hit {
@@ -334,8 +432,8 @@ fn fs_main(in: VertexOutput) -> FragOutput {
     }
   }
 
-  // Edge detection for modes 0, 1, and 2 (TAA): check if hit is near a cube edge
-  if uniforms.aa_mode <= 2u {
+  // Edge detection for modes 0 and 1: check if hit is near a cube edge
+  if uniforms.aa_mode <= 1u {
     let mx = max(abs_rel.x, max(abs_rel.y, abs_rel.z));
     let mn = min(abs_rel.x, min(abs_rel.y, abs_rel.z));
     let mid = abs_rel.x + abs_rel.y + abs_rel.z - mx - mn;
@@ -367,34 +465,7 @@ fn fs_main(in: VertexOutput) -> FragOutput {
     }
   }
 
-  // MSAA Alpha mode (mode 4): RGSS hit-count coverage for alpha-to-coverage
   var final_alpha = 1.0;
-  if uniforms.aa_mode == 4u {
-    let d0 = in.ray_dir + ddx_dir * -0.125 + ddy_dir * -0.375;
-    let d1 = in.ray_dir + ddx_dir *  0.375 + ddy_dir * -0.125;
-    let d2 = in.ray_dir + ddx_dir * -0.375 + ddy_dir *  0.125;
-    let d3 = in.ray_dir + ddx_dir *  0.125 + ddy_dir *  0.375;
-
-    var hits = 0.0;
-    let t0 = ray_aabb(in.ray_origin, d0, box_min, box_max);
-    if t0.x <= t0.y && t0.y >= 0.0 { hits += 1.0; }
-    let t1 = ray_aabb(in.ray_origin, d1, box_min, box_max);
-    if t1.x <= t1.y && t1.y >= 0.0 { hits += 1.0; }
-    let t2 = ray_aabb(in.ray_origin, d2, box_min, box_max);
-    if t2.x <= t2.y && t2.y >= 0.0 { hits += 1.0; }
-    let t3 = ray_aabb(in.ray_origin, d3, box_min, box_max);
-    if t3.x <= t3.y && t3.y >= 0.0 { hits += 1.0; }
-
-    final_alpha = hits / 4.0;
-
-    // Per-voxel alpha dither to decorrelate coverage masks at shared boundaries
-    // Without this, adjacent voxels with identical alpha get identical MSAA coverage
-    // masks, leaving uncovered samples that bleed background color (dark contour lines)
-    if hits < 4.0 {
-      let vh = fract(sin(dot(in.box_center, vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
-      final_alpha = saturate(final_alpha + (vh - 0.5) * 0.25);
-    }
-  }
 
   // LOD debug visualization: blend with LOD palette color when bit 0 set
   if (uniforms.debug_flags & 1u) != 0u {
