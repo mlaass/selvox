@@ -275,8 +275,8 @@ async function main() {
   // Click-to-play overlay
   const hint = document.createElement('div');
   hint.style.cssText = 'position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.7);color:#fff;font:13px/1.5 system-ui;padding:10px 18px;border-radius:8px;z-index:9998;pointer-events:none;text-align:center';
-  hint.innerHTML = `<b>Click to control</b><br>
-    <span style="opacity:0.7">WASD + Mouse to move · Space/Ctrl: up/down · Shift: faster · P: performance · O: controls</span>`;
+  hint.innerHTML = `<b>Click to control</b> &nbsp;<br>
+    <span style="opacity:0.7">WASD + Mouse to move - Space/Ctrl: up/down - Shift: fast - P: performance - O: controls</span>`;
   document.body.appendChild(hint);
 
   document.addEventListener('pointerlockchange', () => {
