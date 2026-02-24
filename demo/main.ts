@@ -427,6 +427,31 @@ async function main() {
   bevelRow.appendChild(bevelVal);
   panel.appendChild(bevelRow);
 
+  // Depth Bevel slider
+  const dbRow = document.createElement('div');
+  dbRow.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:2px';
+  const dbLabel = document.createElement('span');
+  dbLabel.textContent = 'D.Bevel';
+  const dbValSpan = document.createElement('span');
+  dbValSpan.style.cssText = 'margin-left:auto;min-width:28px;text-align:right';
+  dbValSpan.textContent = '0%';
+  const dbSlider = document.createElement('input');
+  dbSlider.type = 'range';
+  dbSlider.min = '0';
+  dbSlider.max = '0.0001';
+  dbSlider.step = '0.000001';
+  dbSlider.value = '0';
+  dbSlider.style.cssText = 'flex:1;cursor:pointer';
+  dbSlider.addEventListener('input', () => {
+    const v = Number(dbSlider.value);
+    renderer.setDepthBevel(v);
+    dbValSpan.textContent = `${Math.round(v / 0.0001 * 100)}%`;
+  });
+  dbRow.appendChild(dbLabel);
+  dbRow.appendChild(dbSlider);
+  dbRow.appendChild(dbValSpan);
+  panel.appendChild(dbRow);
+
   // Separator
   const sep2 = document.createElement('hr');
   sep2.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';

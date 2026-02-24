@@ -85,6 +85,7 @@ export class VoxelRenderer {
   private subpixelThreshold = 0.8;
   private voxelScaleFactor = 1.0;
   private bevelRadius = 0.0;
+  private depthBevel = 0.0;
 
   // Cached view-projection matrix for frustum extraction
   private viewProjMatrix = new Float32Array(16);
@@ -622,6 +623,14 @@ export class VoxelRenderer {
     return this.bevelRadius;
   }
 
+  setDepthBevel(v: number): void {
+    this.depthBevel = Math.max(0.0, Math.min(0.0001, v));
+  }
+
+  get currentDepthBevel(): number {
+    return this.depthBevel;
+  }
+
   get drawCallCount(): number {
     return this.lastDrawCallCount;
   }
@@ -722,6 +731,8 @@ export class VoxelRenderer {
     f[45] = this.voxelScaleFactor;
     // bevel_radius: offset 46
     f[46] = this.bevelRadius;
+    // depth_bevel: offset 47
+    f[47] = this.depthBevel;
 
     // Update bilateral uniforms if in bilateral mode
     if (this.aaMode === AAMode.Bilateral && this.bilateralUniformBuffer && this.device) {

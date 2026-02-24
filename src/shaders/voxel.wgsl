@@ -15,6 +15,7 @@ struct Uniforms {
   jitter_y:       f32,           // 176
   voxel_scale:    f32,           // 180
   bevel_radius:   f32,           // 184
+  depth_bevel:    f32,           // 188
 };
 
 struct ChunkUniforms {
@@ -288,6 +289,15 @@ fn shade_ray(ray_origin: vec3<f32>, ray_dir: vec3<f32>, box_min: vec3<f32>, box_
   // Depth
   let hit_clip = uniforms.view_proj * vec4<f32>(result.hit_pos, 1.0);
   result.depth = hit_clip.z / hit_clip.w;
+
+  // Depth beveling: push edges back to prevent Z-fighting between adjacent voxels
+  if uniforms.depth_bevel > 0.0 {
+    let local_hit = abs((result.hit_pos - center) / half);
+    let sorted_max = max(local_hit.x, max(local_hit.y, local_hit.z));
+    let sorted_min = min(local_hit.x, min(local_hit.y, local_hit.z));
+    let edge_prox = local_hit.x + local_hit.y + local_hit.z - sorted_max - sorted_min;
+    result.depth += edge_prox * edge_prox * uniforms.depth_bevel;
+  }
 
   return result;
 }
