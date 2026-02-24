@@ -239,9 +239,21 @@ async function main() {
     console.log('selvox: WebGPU initialized successfully.');
   } catch (err) {
     console.error('selvox: Failed to initialize WebGPU.', err);
+    const isChrome = navigator.userAgent.includes('Chrome');
     document.body.innerHTML = `
-      <div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;color:#ccc;background:#111;">
-        <p>WebGPU is not available. Use a supported browser (Chrome 113+, Edge 113+, or Firefox Nightly with flags).</p>
+      <div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;color:#ccc;background:#111;padding:2rem;">
+        <div style="max-width:520px;line-height:1.6">
+          <p style="margin-bottom:1rem;">WebGPU is not available.</p>
+          ${isChrome ? `
+          <p style="margin-bottom:0.5rem;">Try enabling it in Chrome:</p>
+          <ol style="padding-left:1.2rem;margin:0;">
+            <li>Go to <code style="color:#fff;">chrome://flags</code></li>
+            <li>Search <b>Vulkan</b> &mdash; set to <b>Enabled</b></li>
+            <li>Search <b>Unsafe WebGPU</b> &mdash; set to <b>Enabled</b></li>
+            <li>Click <b>Relaunch</b></li>
+          </ol>
+          ` : `<p>Use a supported browser (Chrome 113+, Edge 113+, or Firefox Nightly with flags).</p>`}
+        </div>
       </div>`;
     return;
   }
@@ -255,10 +267,21 @@ async function main() {
   const camera = new FlyCamera({
     position: new Float64Array([0, 40, 80]),
     yaw: 0,
-    pitch: -0.35,
+    pitch: 0.35,
     speed: 15,
   });
   camera.attach(canvas);
+
+  // Click-to-play overlay
+  const hint = document.createElement('div');
+  hint.style.cssText = 'position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.7);color:#fff;font:13px/1.5 system-ui;padding:10px 18px;border-radius:8px;z-index:9998;pointer-events:none;text-align:center';
+  hint.innerHTML = `<b>Click to control</b><br>
+    <span style="opacity:0.7">WASD + Mouse to move · Space/Ctrl: up/down · Shift: faster · P: performance · O: controls</span>`;
+  document.body.appendChild(hint);
+
+  document.addEventListener('pointerlockchange', () => {
+    hint.style.display = document.pointerLockElement === canvas ? 'none' : 'flex';
+  });
 
   // Performance overlay
   const overlay = new PerformanceOverlay(canvas);
