@@ -1,7 +1,7 @@
 import { BlockAllocator } from './BlockAllocator.js';
 
 const VOXEL_STRIDE = 64; // bytes per voxel
-const DEFAULT_MAX_VOXELS = 4_000_000;
+const DEFAULT_MAX_VOXELS = 16_000_000;
 
 export interface PoolStats {
   totalVoxels: number;

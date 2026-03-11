@@ -109,7 +109,7 @@ export class VoxelRenderer {
   constructor(canvas: HTMLCanvasElement, options?: RendererOptions) {
     this.canvas = canvas;
     this.options = options ?? {};
-    this.maxVoxels = this.options.maxVoxels ?? 2_000_000;
+    this.maxVoxels = this.options.maxVoxels ?? 16_000_000;
   }
 
   async initialize(): Promise<void> {
