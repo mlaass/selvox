@@ -13,7 +13,7 @@ The `request_id` is set by the client and echoed back by the server, allowing re
 
 ### 1.1 Layers
 
-All patch-scoped messages include a `layer` field (u32) immediately after the common header. Layers are generic namespaces that can represent semantic world layers (terrain, buildings, foliage), simulation time frames, data channels, or any other partitioning of voxel data. The server stores data as `db[layer][patch.xyz][lodlvl]`.
+All patch-scoped messages include a `layer` field (u32) immediately after the common header. Layers are generic namespaces that can represent semantic world layers (terrain, buildings, foliage), simulation time frames, data channels, or any other partitioning of voxel data.
 
 Metadata (world size, palette, max LOD level) is global and shared across all layers.
 
@@ -30,9 +30,9 @@ Metadata (world size, palette, max LOD level) is global and shared across all la
 | `0x07` | List Layers | *(none)* |
 
 - **Handshake**: initiates the connection; server responds with Metadata.
-- **Request Patch**: fetch a single patch at the given LOD level and grid coordinates within the specified layer.
-- **Request Patches**: batch request for multiple patches in one message. All patches in a batch belong to the same layer. Each entry is 13 bytes (1B level + 3*4B coords).
-- **List Patches**: list all non-empty patches at the given LOD level within the specified layer.
+- **Request Patch**: fetch a single patch at the given LOD level and grid coordinates.
+- **Request Patches**: batch request for multiple patches in one message. Each entry is 13 bytes (1B level + 3*4B coords).
+- **List Patches**: list all non-empty patches at the given LOD level.
 - **List Layers**: list all layers that currently contain data.
 
 ### 2.2 Server -> Client
@@ -46,10 +46,10 @@ Metadata (world size, palette, max LOD level) is global and shared across all la
 | `0x87` | Layer List | `[2B count][count * 4B layer]` |
 | `0xFF` | Error | `[2B code][UTF-8 message]` |
 
-- **Metadata**: world dimensions in patches, maximum LOD level, and color palette. `palette_count` gives N (max 255), followed by N * 3-byte RGB entries. Metadata is global (shared across all layers).
+- **Metadata**: world dimensions in patches, maximum LOD level, and color palette. `palette_count` gives N (max 255), followed by N * 3-byte RGB entries.
 - **Patch Data**: voxel data for a single patch. See §2.3 for encodings.
 - **Batch Patch Data**: multiple patches in one message, all from the same layer. Each `patch_data` entry has the same layout as Patch Data's payload (level + coords + encoding + data), concatenated with no padding.
-- **Patch List**: coordinates of all non-empty patches at the requested level within the specified layer.
+- **Patch List**: coordinates of all non-empty patches at the requested level.
 - **Layer List**: all layer IDs that currently contain data.
 - **Error**: numeric error code and a UTF-8 error description.
 
@@ -73,31 +73,22 @@ for z in 0..size:
 
 ```mermaid
 sequenceDiagram
-  participant Server
   participant Client
+  participant Server
 
   Client->>Server: Handshake (0x01)
-  Server-->>Client: Metadata (0x81)
-  Note over Client,Server: world size, palette (global)
+  Server-->>Client: Metadata (0x81)\nworld size, palette
 
-  Client->>Server: List Layers (0x07)
-  Server-->>Client: Layer List (0x87)
-  Note over Client,Server: discover available layers
+  Client->>Server: List Patches (0x04, level=3)
+  Server-->>Client: Patch List (0x84)\nwhich patches exist
 
-  Client->>Server: List Patches (0x04, layer=0, level=3)
-  Server-->>Client: Patch List (0x84, layer=0)
-  Note over Client,Server: which patches exist in layer 0
+  Client->>Server: Request Patches (0x03)\nbatch of coords at level 3
+  Server-->>Client: Batch Patch Data (0x83)\nvoxel data for all requested
 
-  Client->>Server: Request Patches (0x03, layer=0)
-  Note over Client,Server: batch of coords at level 3
-  Server-->>Client: Batch Patch Data (0x83, layer=0)
-  Note over Client,Server: voxel data for all requested
+  Note over Client,Server: ... camera moves, request more patches at var LOD ...
 
-  Note over Client,Server: ... camera moves, request more patches at varying LOD ...
-
-  Client->>Server: Request Patch (0x02, layer=0)
-  Note over Client,Server: single high-res patch
-  Server-->>Client: Patch Data (0x82, layer=0)
+  Client->>Server: Request Patch (0x02) single high-res patch
+  Server-->>Client: Patch Data (0x82)
 ```
 
 ## 3. Write Protocol
@@ -108,10 +99,10 @@ The write protocol allows clients to push voxel data to the server. Writes are a
 
 | Type | Name | Payload |
 |------|------|---------|
-| `0x05` | Put Patch | `[4B layer][4B px][4B py][4B pz][1B encoding][data]` |
+| `0x05` | Put Patch | `[4B layer][4B px][4B py][4B pz][data]` |
 | `0x06` | Delete Patch | `[4B layer][4B px][4B py][4B pz]` |
 
-- **Put Patch**: write a full-resolution 64^3 patch to the specified layer. No `level` field — writes are always level 6. Encoding must be `1` (dense); use Delete Patch instead of sending an empty patch.
+- **Put Patch**: write a full-resolution 64^3 patch to the specified layer. No `level` field - writes are always level 6. Data is always dense (262,144 bytes).
 - **Delete Patch**: remove a patch and all its LOD levels from the specified layer.
 
 ### 3.2 Server -> Client
@@ -122,20 +113,19 @@ The write protocol allows clients to push voxel data to the server. Writes are a
 | `0x86` | Delete Ack | `[4B layer][4B px][4B py][4B pz][1B status]` |
 
 Status codes:
-- `0x00` — success
-- `0x01` — error (details in a separate Error message if needed)
+- `0x00` - success
+- `0x01` - error (details in a separate Error message if needed)
 
 ### 3.3 Write Flow
 
 ```mermaid
 sequenceDiagram
-  participant Server
   participant Client
+  participant Server
 
   Client->>Server: Put Patch (0x05, layer=0)
   Note over Client,Server: (px, py, pz) + 262,144 bytes
-  Note right of Server: server stores patch in layer 0,
-  Note right of Server: rebuilds LOD pyramid
+  Note right of Server: server stores patch in layer 0, rebuilds LOD pyramid
   Server-->>Client: Put Ack (0x85, layer=0, status=0x00)
 
   Client->>Server: Delete Patch (0x06, layer=0)
@@ -144,9 +134,7 @@ sequenceDiagram
 
 ### 3.4 Design Notes
 
-- No `level` field on writes — always full resolution (64^3 bytes = 256 KB). The server is responsible for building coarser LOD levels.
-- Only dense encoding (1) is valid for Put Patch. Encoding 0 (empty) is not meaningful — use Delete Patch to remove data.
-- The server should rebuild the LOD pyramid (levels 0 - 5) from the written level-6 data before sending the ack.
+- The server rebuilds the LOD pyramid (levels 0–5) from the written level-6 data before sending the ack.
 
 ## 4. Data Types Reference
 
@@ -157,7 +145,7 @@ sequenceDiagram
 ### Patch
 - A cube of 64^3 voxels
 - Identified by integer grid coordinates `(px, py, pz)` within a layer
-- World position derived as `patch_coord * 64 * resolution`
+- World position derived as `patch_coord * 64`
 
 ### LOD Levels
 
@@ -170,8 +158,6 @@ sequenceDiagram
 | 4 | 16^3 | 4,096 | 4 KB |
 | 5 | 32^3 | 32,768 | 32 KB |
 | 6 | 64^3 | 262,144 | 256 KB |
-
-LOD levels are only relevant for reads. Writes always operate at level 6 (full resolution).
 
 ### Integer Types
 - Coordinates (`px`, `py`, `pz`, `size_x`, `size_y`, `size_z`): signed 32-bit LE (`i32`)
