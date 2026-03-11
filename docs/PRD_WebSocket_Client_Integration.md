@@ -2,7 +2,7 @@
 
 ## 1. Summary
 
-A `WebSocketVoxelSource` class that implements `IVoxelDataSource` and connects the selvox renderer to the voxel WebSocket server. Translates server patches (64³ palette-indexed voxel grids) into GPU-ready voxel buffers, integrates with `ChunkManager` for distance-based LOD streaming, and adds a demo UI toggle between local procedural terrain and WebSocket mode.
+A `WebSocketVoxelSource` class that implements `IVoxelDataSource` and connects the selvox renderer to the voxel WebSocket server. Translates server patches (64³ palette-indexed voxel grids) into GPU-ready voxel buffers, integrates with `ChunkManager` for distance-based LOD streaming, and adds a demo UI toggle between demo procedural terrain and WebSocket mode.
 
 All new code lives in `src/` (library) and `demo/` (UI toggle). No server changes required.
 
@@ -27,6 +27,8 @@ Mapping:
 Server LOD levels 0–6 map to resolutions 1³ through 64³. The client's `ChunkManager` requests LOD levels 0–6 where 0 is the finest. The server uses the inverse convention (level 6 = finest, level 0 = coarsest).
 
 Translation: `serverLevel = 6 - clientLevel` (when `maxLodLevel = 6`).
+
+Note: Client LOD 0 = finest resolution. This matches the existing convention used by `TerrainSource` and `MockOctreeSource`.
 
 | Client LOD | Server LOD | Resolution | Voxels per patch | Voxel size (world) |
 |---|---|---|---|---|
@@ -139,7 +141,7 @@ Parse incoming binary frames by reading the first byte (message type):
 
 | Type byte | Handler |
 |---|---|
-| `0x81` | Parse Metadata → store palette, world size |
+| `0x81` | Parse Metadata → store palette, world size (note: `world_size` fields are **signed i32**, use `getInt32()`) |
 | `0x82` | Parse Patch Data → resolve pending request |
 | `0x83` | Parse Batch Patch Data → resolve pending requests |
 | `0x84` | Parse Patch List → return patch coordinates |
@@ -167,7 +169,7 @@ Server sends voxels as single-byte palette indices. The GPU expects 64-byte stru
 Voxel (64 bytes):
   pos_a:   vec4<f32>  (16B) — world position + padding
   color_a: u32        (4B)  — packed RGBA
-  size_a:  f32        (4B)  — voxel half-extent
+  size_a:  f32        (4B)  — voxel full extent (diameter); shaders halve internally
   _pad0:   8B
   pos_b:   vec4<f32>  (16B) — same as pos_a (no interpolation)
   color_b: u32        (4B)  — same as color_a
@@ -179,19 +181,24 @@ Voxel (64 bytes):
 
 For each non-empty voxel in the received patch data:
 
-1. **Compute world position** from patch grid coord + voxel index within the patch:
+1. **Compute local position** from voxel index within the patch (positions are relative to chunk origin, not world space — the chunk's `worldPosition` provides the RTE offset):
    ```
    dimSize = 2^serverLevel           // e.g. 64 for level 6
-   voxelSize = resolution * (64 / dimSize)
-   ix = index % dimSize
+   step = 64 / dimSize               // grid cells per voxel at this LOD
+   voxelSize = resolution * step
+   patchWorldSize = 64 * resolution
+
+   // Server uses C-order (row-major) on shape (X, Y, Z) → Z varies fastest
+   iz = index % dimSize
    iy = floor(index / dimSize) % dimSize
-   iz = floor(index / dimSize²)
-   worldX = (px * 64 + ix * (64/dimSize) + 0.5 * (64/dimSize)) * resolution
-   worldY = (py * 64 + iy * (64/dimSize) + 0.5 * (64/dimSize)) * resolution
-   worldZ = (pz * 64 + iz * (64/dimSize) + 0.5 * (64/dimSize)) * resolution
+   ix = floor(index / dimSize²)
+
+   localX = (ix * step + 0.5 * step) * resolution - patchWorldSize * 0.5
+   localY = (iy * step + 0.5 * step) * resolution - patchWorldSize * 0.5
+   localZ = (iz * step + 0.5 * step) * resolution - patchWorldSize * 0.5
    ```
 
-2. **Look up palette color**: `palette[index - 1]` → `(r, g, b)` → pack as `r | (g << 8) | (b << 16) | (0xFF << 24)`
+2. **Look up palette color**: palette indices in voxel data are 1–255 (0 = empty), so use `palette[paletteIndex - 1]` → `(r, g, b)` → pack as `r | (g << 8) | (b << 16) | (0xFF << 24)`. The `palette_count` byte (0–255) is exactly `len(palette)`; index 0 always means empty and is never in the palette.
 
 3. **Write 64-byte struct**: positions in both A/B slots (no interpolation for static data), color in both slots, size in both slots
 
@@ -206,7 +213,7 @@ For each non-empty voxel in the received patch data:
 
 ### 5.4 RTE (Relative-to-Eye) Integration
 
-The expanded voxel positions are written relative to the patch origin `(px * 64 * res, py * 64 * res, pz * 64 * res)`. This origin becomes the chunk's `worldPosition` (Float64Array), and the renderer applies RTE offsets per-chunk for large-world precision.
+The expanded voxel positions are written relative to the patch origin (local space). The chunk's `worldPosition` is set to `(px * 64 * resolution, py * 64 * resolution, pz * 64 * resolution)` as a `Float64Array`, and the renderer applies RTE offsets per-chunk for large-world precision.
 
 ## 6. ChunkManager Configuration
 
@@ -214,23 +221,26 @@ The expanded voxel positions are written relative to the patch origin `(px * 64 
 
 `ChunkManager` iterates a 2D XZ grid with distance-based LOD rings. Each LOD level doubles the chunk size and radius. This works for heightmap terrain but not for 3D server data.
 
+Currently, `BASE_CHUNK_SIZE = 16` is a hardcoded module-level constant in `ChunkManager.ts`. To support WebSocket mode where patch sizes differ, `ChunkManager` must be refactored to accept `chunkSize` as a constructor parameter via `ChunkManagerOptions`. The module constant becomes the default value, preserving backward compatibility.
+
 ### 6.2 Adaptation Strategy
 
 Rather than rewriting ChunkManager for 3D, use a **column-based approach**:
 
 1. `ChunkManager` continues to operate in 2D (XZ grid)
 2. For each XZ cell, `WebSocketVoxelSource.requestChunk()` internally requests **all Y-layers** for that column
-3. Returns a merged `VoxelDataChunk` containing voxels from all Y patches at that XZ position
-4. The `bbox` Y range from ChunkManager covers the full world height
+3. The source fetches all Y-layer patches, expands each to GPU format, and concatenates the buffers into a single merged `VoxelDataChunk`
+4. The merged chunk's `worldPosition` uses the XZ column center and the mid-Y of the world bounds (from Metadata `size_y`)
+5. The `bbox` Y range from ChunkManager covers the full world height
 
-This keeps ChunkManager changes minimal while supporting 3D data.
+This keeps ChunkManager changes minimal while supporting 3D data. Since `requestChunk()` returns a single `VoxelDataChunk`, the multi-Y merging is entirely internal to `WebSocketVoxelSource`.
 
 ### 6.3 Configuration for Server Data
 
-| Parameter | Local terrain value | WebSocket value | Rationale |
+| Parameter | Demo terrain value | WebSocket value | Rationale |
 |---|---|---|---|
-| `BASE_CHUNK_SIZE` | 16 | `64 * resolution` | Match server patch size |
-| `radiusScale` | 48 | 2–4 | Fewer patches, each is larger |
+| `chunkSize` | 16 (default) | `64 * resolution` | Constructor option; match server patch size |
+| `radiusScale` | 48 | `2 * patchWorldSize` | See worked example in section 7.1 |
 | `maxChunksPerFrame` | 4 | 2 | Network latency limits throughput |
 | `maxLodLevel` | 6 | 6 | Match server's 7 LOD levels |
 
@@ -254,17 +264,29 @@ async connect(): Promise<void> {
 
 ### 7.1 LOD Ring Distances
 
-The `ChunkManager` uses `radiusScale * (1 << level)` for each LOD ring's outer radius. With server data, the distances should be tuned for patch size:
+The `ChunkManager` uses `radiusScale * (1 << level)` for each LOD ring's outer radius. With server data, the distances should be tuned for patch size.
+
+#### Worked Example: `resolution = 0.5`
 
 ```
-patchWorldSize = 64 * resolution  // e.g. 64 * 0.5 = 32 world units
-
-LOD 0 (finest):   0 – 2 patches away     → radiusScale = 2 * patchWorldSize
-LOD 1:            2 – 4 patches away
-LOD 2:            4 – 8 patches away
-...
-LOD 6 (coarsest): 64 – 128 patches away
+patchWorldSize = 64 * 0.5 = 32 world units
+chunkSize = patchWorldSize = 32  (set via ChunkManagerOptions)
+radiusScale = 2 * patchWorldSize = 64
 ```
+
+**Ring distance table:**
+
+| Client LOD | Server LOD | Ring outer radius | Ring distance (patches) | Voxel size |
+|---|---|---|---|---|
+| 0 (finest) | 6 (64³) | `64 * 1 = 64` | 2 patches | 0.5 |
+| 1 | 5 (32³) | `64 * 2 = 128` | 4 patches | 1.0 |
+| 2 | 4 (16³) | `64 * 4 = 256` | 8 patches | 2.0 |
+| 3 | 3 (8³) | `64 * 8 = 512` | 16 patches | 4.0 |
+| 4 | 2 (4³) | `64 * 16 = 1024` | 32 patches | 8.0 |
+| 5 | 1 (2³) | `64 * 32 = 2048` | 64 patches | 16.0 |
+| 6 (coarsest) | 0 (1³) | `64 * 64 = 4096` | 128 patches | 32.0 |
+
+**Grid cell / patch size alignment:** When `chunkSize` is set to `patchWorldSize` (e.g., 32), ChunkManager grid cells align 1:1 with server patches at LOD 0. At coarser LOD levels, ChunkManager doubles the cell size per level (`chunkSize * (1 << level)`), which naturally matches the server's coarser patches covering the same world extent. If `chunkSize` does not match `patchWorldSize`, the source must map each ChunkManager cell to the overlapping server patch(es) — this is avoided by setting `chunkSize = 64 * resolution`.
 
 ### 7.2 Adaptive Loading
 
@@ -276,16 +298,14 @@ For large datasets, not all LOD 0 patches will fit in the GPU pool (16M voxel li
 
 ### 7.3 Budget Awareness
 
-The source can track approximate voxel counts per active LOD level:
+The renderer's default voxel pool is **16M voxels**. Budget estimates:
 
-| LOD level | Max voxels per patch | Typical non-empty % | Effective voxels |
-|---|---|---|---|
-| 0 (64³) | 262,144 | 10–30% | ~26K–79K |
-| 1 (32³) | 32,768 | 20–50% | ~6K–16K |
-| 2 (16³) | 4,096 | 30–70% | ~1K–3K |
-| 3 (8³) | 512 | 50–90% | ~256–460 |
-
-With a 16M voxel pool, this allows roughly 200–600 patches at LOD 0, or thousands at LOD 3.
+| LOD level | Max voxels per patch | Typical non-empty % | Effective voxels | Patches @ 16M pool |
+|---|---|---|---|---|
+| 0 (64³) | 262,144 | 10–30% | ~26K–79K | 200–615 |
+| 1 (32³) | 32,768 | 20–50% | ~6K–16K | 1000–2666 |
+| 2 (16³) | 4,096 | 30–70% | ~1K–3K | 5333–16000 |
+| 3 (8³) | 512 | 50–90% | ~256–460 | 34783–62500 |
 
 ## 8. Demo UI Toggle
 
@@ -293,7 +313,7 @@ With a 16M voxel pool, this allows roughly 200–600 patches at LOD 0, or thousa
 
 Add a dropdown or toggle to `demo/main.ts` that switches between:
 
-- **Local** (default): current procedural terrain + houses generation
+- **Demo** (default): current procedural terrain + houses generation
 - **WebSocket**: connects to the voxel server
 
 ### 8.2 UI Design
@@ -302,7 +322,7 @@ A simple `<select>` in the existing controls panel (toggled with `O`):
 
 ```
 ┌─ Controls ─────────────┐
-│ Source [Local ▾]        │
+│ Source [Demo ▾]         │
 │ Server [ws://...:9876]  │  ← only visible in WebSocket mode
 │ [Connect]               │  ← only visible in WebSocket mode
 │ ─────────────────────── │
@@ -313,18 +333,18 @@ A simple `<select>` in the existing controls panel (toggled with `O`):
 
 ### 8.3 Mode Switch Behavior
 
-1. **Local → WebSocket**:
+1. **Demo → WebSocket**:
    - Unload all current chunks (`renderer.unloadAll()` or per-chunk unload)
    - Create `WebSocketVoxelSource`, call `connect()`
    - Create new `ChunkManager` with the WebSocket source and server-tuned options
    - Begin streaming loop
 
-2. **WebSocket → Local**:
+2. **WebSocket → Demo**:
    - `ChunkManager.unloadAll()`
    - `WebSocketVoxelSource.disconnect()`
-   - Regenerate and load local terrain chunks
+   - Regenerate and load demo terrain chunks
 
-3. **Connection failure**: show error in the controls panel, fall back to Local mode
+3. **Connection failure**: show error in the controls panel, fall back to Demo mode
 
 ### 8.4 URL Configuration
 
@@ -345,12 +365,12 @@ The server URL defaults to `ws://localhost:9876` and is editable via a text inpu
 | File | Change |
 |---|---|
 | `src/index.ts` | Re-export `WebSocketVoxelSource` and WS types |
+| `src/ChunkManager.ts` | Add `chunkSize` to `ChunkManagerOptions`; use it instead of hardcoded `BASE_CHUNK_SIZE` |
 | `demo/main.ts` | Add source toggle UI, WebSocket mode, ChunkManager integration |
 
 ### Unchanged
 
 - `src/VoxelRenderer.ts` — no changes needed, already supports `loadChunk`/`unloadChunk`
-- `src/ChunkManager.ts` — usable as-is for v1 (column-based approach avoids 3D grid changes)
 - Server code — no modifications required
 
 ## 10. Development Plan
