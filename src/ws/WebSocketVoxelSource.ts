@@ -152,29 +152,42 @@ export class WebSocketVoxelSource implements IVoxelDataSource {
 
     const res = this.resolution;
     const patchWorld = 64 * res;
-    const px = Math.round(bbox[0] / patchWorld);
-    const pz = Math.round(bbox[2] / patchWorld);
+
+    // A chunk at lodLevel covers patchSpan × patchSpan base patches
+    const patchSpan = 1 << lodLevel;
+    const pxMin = Math.round(bbox[0] / patchWorld);
+    const pzMin = Math.round(bbox[2] / patchWorld);
 
     const serverLevel = this.metadata.maxLevel - lodLevel;
     const maxPy = Math.ceil(this.metadata.worldSize[1] / 64) - 1;
     const minPy = 0;
 
-    // Filter Y patches that exist
-    const yPatches: number[] = [];
-    for (let py = minPy; py <= maxPy; py++) {
-      if (this.knownPatches.has(`${px}_${py}_${pz}`)) {
-        yPatches.push(py);
+    // Collect all (px, py, pz) patches that exist within the bbox footprint
+    const allPatches: { px: number; py: number; pz: number }[] = [];
+    for (let dpx = 0; dpx < patchSpan; dpx++) {
+      for (let dpz = 0; dpz < patchSpan; dpz++) {
+        const px = pxMin + dpx;
+        const pz = pzMin + dpz;
+        for (let py = minPy; py <= maxPy; py++) {
+          if (this.knownPatches.has(`${px}_${py}_${pz}`)) {
+            allPatches.push({ px, py, pz });
+          }
+        }
       }
     }
 
     const chunkWorldY = this.metadata.worldSize[1] * res * 0.5;
-    const id = `ws_L${lodLevel}_${this.layer}_${px}_${pz}`;
+    const chunkCenterX = pxMin * patchWorld + patchSpan * patchWorld * 0.5;
+    const chunkCenterZ = pzMin * patchWorld + patchSpan * patchWorld * 0.5;
+    const id = `ws_L${lodLevel}_${this.layer}_${pxMin}_${pzMin}`;
 
-    if (yPatches.length === 0) {
+    console.debug(`[WS] request lod=${lodLevel} srvLvl=${serverLevel} patches=${allPatches.length} bbox=[${bbox[0].toFixed(0)},${bbox[2].toFixed(0)}..${bbox[3].toFixed(0)},${bbox[5].toFixed(0)}]`);
+
+    if (allPatches.length === 0) {
       return {
         id,
         lodLevel,
-        worldPosition: new Float64Array([px * patchWorld + patchWorld * 0.5, chunkWorldY, pz * patchWorld + patchWorld * 0.5]),
+        worldPosition: new Float64Array([chunkCenterX, chunkWorldY, chunkCenterZ]),
         data: new ArrayBuffer(0),
       };
     }
@@ -182,8 +195,8 @@ export class WebSocketVoxelSource implements IVoxelDataSource {
     // Request patches
     let patchResults: { level: number; px: number; py: number; pz: number; encoding: number; voxelData: Uint8Array | null }[];
 
-    if (yPatches.length === 1) {
-      const py = yPatches[0];
+    if (allPatches.length === 1) {
+      const { px, py, pz } = allPatches[0];
       const msg = await this.sendRequest((reqId) =>
         encodeRequestPatch(reqId, this.layer, serverLevel, px, py, pz),
       );
@@ -191,7 +204,7 @@ export class WebSocketVoxelSource implements IVoxelDataSource {
       const pd = msg as PatchDataMessage;
       patchResults = [{ level: pd.level, px: pd.px, py: pd.py, pz: pd.pz, encoding: pd.encoding, voxelData: pd.voxelData }];
     } else {
-      const batchPatches = yPatches.map((py) => ({ level: serverLevel, px, py, pz }));
+      const batchPatches = allPatches.map((p) => ({ level: serverLevel, px: p.px, py: p.py, pz: p.pz }));
       const msg = await this.sendRequest((reqId) =>
         encodeRequestBatch(reqId, this.layer, batchPatches),
       );
@@ -203,10 +216,14 @@ export class WebSocketVoxelSource implements IVoxelDataSource {
     const buffers: ArrayBuffer[] = [];
     for (const patch of patchResults) {
       if (patch.encoding === 0 || !patch.voxelData) continue;
+      const xOffset = (patch.px * patchWorld + patchWorld * 0.5) - chunkCenterX;
       const yOffset = (patch.py * patchWorld + patchWorld * 0.5) - chunkWorldY;
-      const expanded = this.expandPatchToGPU(patch.voxelData, patch.level, yOffset);
+      const zOffset = (patch.pz * patchWorld + patchWorld * 0.5) - chunkCenterZ;
+      const expanded = this.expandPatchToGPU(patch.voxelData, patch.level, xOffset, yOffset, zOffset);
       if (expanded.byteLength > 0) buffers.push(expanded);
     }
+
+    console.debug(`[WS] expanded ${buffers.reduce((s, b) => s + b.byteLength / VOXEL_STRIDE, 0)} voxels from ${patchResults.length} patches`);
 
     // Concatenate
     const totalBytes = buffers.reduce((sum, b) => sum + b.byteLength, 0);
@@ -221,11 +238,7 @@ export class WebSocketVoxelSource implements IVoxelDataSource {
     return {
       id,
       lodLevel,
-      worldPosition: new Float64Array([
-        px * patchWorld + patchWorld * 0.5,
-        chunkWorldY,
-        pz * patchWorld + patchWorld * 0.5,
-      ]),
+      worldPosition: new Float64Array([chunkCenterX, chunkWorldY, chunkCenterZ]),
       data,
     };
   }
@@ -233,7 +246,9 @@ export class WebSocketVoxelSource implements IVoxelDataSource {
   private expandPatchToGPU(
     voxelData: Uint8Array,
     serverLevel: number,
+    xOffset: number,
     yOffset: number,
+    zOffset: number,
   ): ArrayBuffer {
     const palette = this.metadata!.palette;
     const res = this.resolution;
@@ -263,9 +278,9 @@ export class WebSocketVoxelSource implements IVoxelDataSource {
       const iy = Math.floor(i / dim) % dim;
       const ix = Math.floor(i / (dim * dim));
 
-      const localX = (ix * step + 0.5 * step) * res - patchWorldSize * 0.5;
+      const localX = (ix * step + 0.5 * step) * res - patchWorldSize * 0.5 + xOffset;
       const localY = (iy * step + 0.5 * step) * res - patchWorldSize * 0.5 + yOffset;
-      const localZ = (iz * step + 0.5 * step) * res - patchWorldSize * 0.5;
+      const localZ = (iz * step + 0.5 * step) * res - patchWorldSize * 0.5 + zOffset;
 
       // Palette lookup (1-indexed)
       const pi = (val - 1) * 3;
