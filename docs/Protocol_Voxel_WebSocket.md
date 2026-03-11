@@ -13,7 +13,7 @@ The `request_id` is set by the client and echoed back by the server, allowing re
 
 ## 2. Read Protocol
 
-### 2.1 Client → Server
+### 2.1 Client -> Server
 
 | Type | Name | Payload |
 |------|------|---------|
@@ -27,7 +27,7 @@ The `request_id` is set by the client and echoed back by the server, allowing re
 - **Request Patches**: batch request for multiple patches in one message. Each entry is 13 bytes (1B level + 3*4B coords).
 - **List Patches**: list all non-empty patches at the given LOD level.
 
-### 2.2 Server → Client
+### 2.2 Server -> Client
 
 | Type | Name | Payload |
 |------|------|---------|
@@ -83,19 +83,19 @@ sequenceDiagram
 
 ## 3. Write Protocol
 
-The write protocol allows clients to push voxel data to the server. Writes are always at full resolution (64³, level 6). The server recomputes the LOD pyramid internally after receiving a write.
+The write protocol allows clients to push voxel data to the server. Writes are always at full resolution (64^3, level 6). The server recomputes the LOD pyramid internally after receiving a write.
 
-### 3.1 Client → Server
+### 3.1 Client -> Server
 
 | Type | Name | Payload |
 |------|------|---------|
 | `0x05` | Put Patch | `[4B px][4B py][4B pz][1B encoding][data]` |
 | `0x06` | Delete Patch | `[4B px][4B py][4B pz]` |
 
-- **Put Patch**: write a full-resolution 64³ patch. No `level` field — writes are always level 6. Encoding must be `1` (dense); use Delete Patch instead of sending an empty patch.
+- **Put Patch**: write a full-resolution 64^3 patch. No `level` field — writes are always level 6. Encoding must be `1` (dense); use Delete Patch instead of sending an empty patch.
 - **Delete Patch**: remove a patch and all its LOD levels.
 
-### 3.2 Server → Client
+### 3.2 Server -> Client
 
 | Type | Name | Payload |
 |------|------|---------|
@@ -123,18 +123,18 @@ sequenceDiagram
 
 ### 3.4 Design Notes
 
-- No `level` field on writes — always full resolution (64³ = 262,144 bytes dense). The server is responsible for building coarser LOD levels.
+- No `level` field on writes — always full resolution (64^3 bytes = 256 KB). The server is responsible for building coarser LOD levels.
 - Only dense encoding (1) is valid for Put Patch. Encoding 0 (empty) is not meaningful — use Delete Patch to remove data.
-- The server should rebuild the LOD pyramid (levels 0–5) from the written level-6 data before sending the ack.
+- The server should rebuild the LOD pyramid (levels 0 - 5) from the written level-6 data before sending the ack.
 
 ## 4. Data Types Reference
 
 ### Voxel Byte
 - `0x00` = empty (air)
-- `0x01`–`0xFF` = palette color index (see Metadata message for palette)
+- `0x01` - `0xFF` = palette color index (see Metadata message for palette)
 
 ### Patch
-- A cube of 64³ voxels
+- A cube of 64^3 voxels
 - Identified by integer grid coordinates `(px, py, pz)`
 - World position derived as `patch_coord * 64 * resolution`
 
@@ -142,13 +142,13 @@ sequenceDiagram
 
 | Level | Resolution | Voxels | Dense Size |
 |-------|-----------|--------|------------|
-| 0 | 1³ | 1 | 1 B |
-| 1 | 2³ | 8 | 8 B |
-| 2 | 4³ | 64 | 64 B |
-| 3 | 8³ | 512 | 512 B |
-| 4 | 16³ | 4,096 | 4 KB |
-| 5 | 32³ | 32,768 | 32 KB |
-| 6 | 64³ | 262,144 | 256 KB |
+| 0 | 1^3 | 1 | 1 B |
+| 1 | 2^3 | 8 | 8 B |
+| 2 | 4^3 | 64 | 64 B |
+| 3 | 8^3 | 512 | 512 B |
+| 4 | 16^3 | 4,096 | 4 KB |
+| 5 | 32^3 | 32,768 | 32 KB |
+| 6 | 64^3 | 262,144 | 256 KB |
 
 LOD levels are only relevant for reads. Writes always operate at level 6 (full resolution).
 
@@ -163,16 +163,16 @@ LOD levels are only relevant for reads. Writes always operate at level 6 (full r
 
 | Code | Direction | Name |
 |------|-----------|------|
-| `0x01` | C→S | Handshake |
-| `0x02` | C→S | Request Patch |
-| `0x03` | C→S | Request Patches |
-| `0x04` | C→S | List Patches |
-| `0x05` | C→S | Put Patch |
-| `0x06` | C→S | Delete Patch |
-| `0x81` | S→C | Metadata |
-| `0x82` | S→C | Patch Data |
-| `0x83` | S→C | Batch Patch Data |
-| `0x84` | S→C | Patch List |
-| `0x85` | S→C | Put Ack |
-| `0x86` | S→C | Delete Ack |
-| `0xFF` | S→C | Error |
+| `0x01` | Client -> Server | Handshake |
+| `0x02` | Client -> Server | Request Patch |
+| `0x03` | Client -> Server | Request Patches |
+| `0x04` | Client -> Server | List Patches |
+| `0x05` | Client -> Server | Put Patch |
+| `0x06` | Client -> Server | Delete Patch |
+| `0x81` | Server -> Client | Metadata |
+| `0x82` | Server -> Client | Patch Data |
+| `0x83` | Server -> Client | Batch Patch Data |
+| `0x84` | Server -> Client | Patch List |
+| `0x85` | Server -> Client | Put Ack |
+| `0x86` | Server -> Client | Delete Ack |
+| `0xFF` | Server -> Client | Error |
