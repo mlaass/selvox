@@ -4,3 +4,5 @@ dist/
 .vite/
 bun.lockb
 server/data/
+*.docx
+*.docx#

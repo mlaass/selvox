@@ -7,6 +7,10 @@
 - `bun run test` — run tests with vitest
 - `bun run typecheck` — type-check without emitting
 
+### Python server (uses uv)
+- `cd server && uv run pytest tests/ -v` — run Python tests
+- `cd server && uv run voxel-server` — start the voxel server
+
 ## Architecture
 
 ### Directory layout
