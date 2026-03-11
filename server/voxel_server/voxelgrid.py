@@ -63,6 +63,26 @@ class VoxelGrid:
         """Return all layers that currently contain data."""
         return sorted(self.patch_lods.keys())
 
+    def voxel_counts(self) -> tuple[int, int]:
+        """Return (total_volume, solid_voxels) across all LOD-6 (full-res) patches."""
+        total = 0
+        solid = 0
+        for layer_dict in self.patch_lods.values():
+            for lods in layer_dict.values():
+                data = lods[6]  # full-resolution patch
+                total += data.size
+                solid += int(np.count_nonzero(data))
+        return total, solid
+
+    def memory_bytes(self) -> int:
+        """Total bytes used by all stored numpy arrays."""
+        total = 0
+        for layer_dict in self.patch_lods.values():
+            for lods in layer_dict.values():
+                for arr in lods:
+                    total += arr.nbytes
+        return total
+
     @staticmethod
     def _downsample(data: np.ndarray) -> np.ndarray:
         """Downsample by 2x: take max non-zero value in each 2x2x2 block.

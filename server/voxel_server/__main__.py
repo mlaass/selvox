@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import time
 
 from .server import start_server
 from .terrain import generate_terrain
@@ -16,7 +17,7 @@ def main() -> None:
     parser.add_argument(
         "--terrain-size",
         type=int,
-        default=256,
+        default=4096,
         help="Procedural terrain size (if no file given)",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -26,6 +27,7 @@ def main() -> None:
     logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("websockets").setLevel(logging.INFO)
 
+    t0 = time.perf_counter()
     if args.file:
         from .ingest import ingest_las
 
@@ -34,8 +36,31 @@ def main() -> None:
     else:
         print(f"Generating procedural terrain ({args.terrain_size}x{args.terrain_size})...")
         grid = generate_terrain(args.terrain_size)
+    elapsed = time.perf_counter() - t0
 
-    print(f"Loaded {len(grid.patch_lods)} patches, serving on port {args.port}")
+    patch_count = sum(len(d) for d in grid.patch_lods.values())
+    layer_count = len(grid.patch_lods)
+    mem_bytes = grid.memory_bytes()
+    if mem_bytes >= 1024 * 1024:
+        mem_str = f"{mem_bytes / (1024 * 1024):.1f} MB"
+    else:
+        mem_str = f"{mem_bytes / 1024:.1f} KB"
+
+    total_vol, solid = grid.voxel_counts()
+
+    def _fmt_count(n: int) -> str:
+        if n >= 1_000_000_000:
+            return f"{n / 1_000_000_000:.1f} billion"
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f} million"
+        if n >= 1_000:
+            return f"{n / 1_000:.0f}k"
+        return str(n)
+
+    print(f"Ready in {elapsed:.2f}s — {patch_count} patches across {layer_count} layer(s), "
+          f"{_fmt_count(solid)} solid / {_fmt_count(total_vol)} total voxels, "
+          f"dataset memory: {mem_str}")
+    print(f"Serving on port {args.port}")
     asyncio.run(start_server(grid, "0.0.0.0", args.port))
 
 
