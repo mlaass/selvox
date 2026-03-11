@@ -46,6 +46,9 @@ export class ChunkManager {
   // Loaded voxels counter for the most recent update cycle
   private _lastLoadedVoxels = 0;
 
+  // Throttled logging
+  private lastLogTime = 0;
+
   constructor(
     renderer: VoxelRenderer,
     source: IVoxelDataSource,
@@ -86,85 +89,27 @@ export class ChunkManager {
       this.lastCamGridX = camGridX;
       this.lastCamGridZ = camGridZ;
 
-      // Build the desired set from finest (LOD 0) to coarsest, using sub-cell coverage
-      // to prevent overlap: a coarser chunk is only added if not all its finer sub-cells exist.
-      //
-      // Key format per LOD level: `L_gx_gz`
-      const desiredByLod: Map<string, { gridX: number; gridZ: number; dist: number }>[] = [];
-      for (let L = 0; L <= this.maxLodLevel; L++) {
-        desiredByLod.push(new Map());
-      }
-
-      for (let L = 0; L <= this.maxLodLevel; L++) {
-        const chunkSize = this.chunkSize * (1 << L);
-        const outerRadius = this.radiusScale * (1 << L);
-        const innerRadius = L > 0 ? this.radiusScale * (1 << (L - 1)) : 0;
-
-        const gridCX = Math.floor(camX / chunkSize);
-        const gridCZ = Math.floor(camZ / chunkSize);
-        const scanRadius = Math.ceil(outerRadius / chunkSize) + 1;
-
-        for (let gx = gridCX - scanRadius; gx <= gridCX + scanRadius; gx++) {
-          for (let gz = gridCZ - scanRadius; gz <= gridCZ + scanRadius; gz++) {
-            const cx = (gx + 0.5) * chunkSize;
-            const cz = (gz + 0.5) * chunkSize;
-            const dx = cx - camX;
-            const dz = cz - camZ;
-            const dist = Math.sqrt(dx * dx + dz * dz);
-
-            if (dist >= innerRadius && dist < outerRadius) {
-              // For LOD > 0, check if all 4 sub-cells at LOD L-1 are already covered
-              if (L > 0) {
-                const finerMap = desiredByLod[L - 1];
-                const sx = gx * 2;
-                const sz = gz * 2;
-                const allCovered =
-                  finerMap.has(`${sx}_${sz}`) &&
-                  finerMap.has(`${sx + 1}_${sz}`) &&
-                  finerMap.has(`${sx}_${sz + 1}`) &&
-                  finerMap.has(`${sx + 1}_${sz + 1}`);
-                if (allCovered) continue;
-              }
-
-              desiredByLod[L].set(`${gx}_${gz}`, { gridX: gx, gridZ: gz, dist });
-            }
-          }
-        }
-      }
-
-      // Flatten into a single desired map keyed by the chunk key used for management
+      // Build the desired set via top-down quadtree subdivision.
+      // Start at the coarsest LOD covering the max view distance, then
+      // recursively subdivide cells whose distance warrants a finer LOD.
+      // This guarantees complete coverage: a cell either stays or splits
+      // into 4 children — it never disappears.
       const desired = new Map<string, { lodLevel: number; gridX: number; gridZ: number; dist: number }>();
-      for (let L = 0; L <= this.maxLodLevel; L++) {
-        for (const [cellKey, info] of desiredByLod[L]) {
-          const key = `terrain_L${L}_${cellKey}`;
-          desired.set(key, { lodLevel: L, gridX: info.gridX, gridZ: info.gridZ, dist: info.dist });
-        }
-      }
+      const maxViewDist = this.radiusScale * (1 << this.maxLodLevel);
+      const coarseCellSize = this.chunkSize * (1 << this.maxLodLevel);
+      const coarseGridCX = Math.floor(camX / coarseCellSize);
+      const coarseGridCZ = Math.floor(camZ / coarseCellSize);
+      const coarseScan = Math.ceil(maxViewDist / coarseCellSize) + 1;
 
-      // Unload chunks no longer desired (with hysteresis)
-      const hysteresis = this.radiusScale * 0.15;
-      const toUnload: string[] = [];
-      for (const [key, managed] of this.managedChunks) {
-        if (!desired.has(key)) {
-          const chunkSize = this.chunkSize * (1 << managed.lodLevel);
-          const cx = (managed.gridX + 0.5) * chunkSize;
-          const cz = (managed.gridZ + 0.5) * chunkSize;
-          const dx = cx - camX;
-          const dz = cz - camZ;
-          const dist = Math.sqrt(dx * dx + dz * dz);
-
-          const outerRadius = this.radiusScale * (1 << managed.lodLevel);
-
-          if (dist >= outerRadius + hysteresis) {
-            toUnload.push(key);
+      for (let gx = coarseGridCX - coarseScan; gx <= coarseGridCX + coarseScan; gx++) {
+        for (let gz = coarseGridCZ - coarseScan; gz <= coarseGridCZ + coarseScan; gz++) {
+          const cx = (gx + 0.5) * coarseCellSize;
+          const cz = (gz + 0.5) * coarseCellSize;
+          const dist = Math.sqrt((cx - camX) ** 2 + (cz - camZ) ** 2);
+          if (dist < maxViewDist + coarseCellSize) {
+            this.buildDesired(camX, camZ, this.maxLodLevel, gx, gz, desired);
           }
         }
-      }
-
-      for (const key of toUnload) {
-        const managed = this.managedChunks.get(key)!;
-        this.renderer.unloadChunk(managed.chunkId);
-        this.managedChunks.delete(key);
       }
 
       // Collect new chunks to load, sorted by distance (closest first)
@@ -194,6 +139,7 @@ export class ChunkManager {
         ]);
 
         try {
+          console.debug(`[CM] load ${item.key} lod=${item.lodLevel} dist=${item.dist.toFixed(0)}`);
           const chunk = await this.source.requestChunk(bbox, item.lodLevel, 0);
           const voxelCount = chunk.data.byteLength / 64;
 
@@ -220,8 +166,74 @@ export class ChunkManager {
       });
 
       await Promise.all(loadPromises);
+
+      // Unload stale chunks AFTER new ones are loaded — prevents gaps/pops.
+      // Old coarse chunks remain visible while finer replacements load.
+      const toUnload: string[] = [];
+      for (const [key] of this.managedChunks) {
+        if (!desired.has(key)) {
+          toUnload.push(key);
+        }
+      }
+      for (const key of toUnload) {
+        const managed = this.managedChunks.get(key)!;
+        console.debug(`[CM] unload ${key}`);
+        this.renderer.unloadChunk(managed.chunkId);
+        this.managedChunks.delete(key);
+      }
+
+      // Throttled summary log (max once per second)
+      const now = performance.now();
+      if (now - this.lastLogTime > 1000) {
+        this.lastLogTime = now;
+        const lodCounts = new Map<number, number>();
+        for (const m of this.managedChunks.values()) {
+          lodCounts.set(m.lodLevel, (lodCounts.get(m.lodLevel) ?? 0) + 1);
+        }
+        const desiredLodCounts = new Map<number, number>();
+        for (const d of desired.values()) {
+          desiredLodCounts.set(d.lodLevel, (desiredLodCounts.get(d.lodLevel) ?? 0) + 1);
+        }
+        const lodStr = [...lodCounts.entries()].sort((a, b) => a[0] - b[0]).map(([l, c]) => `L${l}:${c}`).join(' ');
+        const desiredStr = [...desiredLodCounts.entries()].sort((a, b) => a[0] - b[0]).map(([l, c]) => `L${l}:${c}`).join(' ');
+        console.debug(`[CM] managed=${this.managedChunks.size} [${lodStr}] desired=[${desiredStr}] +${loadBatch.length} -${toUnload.length}`);
+      }
     } finally {
       this.updating = false;
+    }
+  }
+
+  private lodForDistance(dist: number): number {
+    if (dist <= this.radiusScale) return 0;
+    const lod = Math.floor(Math.log2(dist / this.radiusScale));
+    return Math.min(lod, this.maxLodLevel);
+  }
+
+  private buildDesired(
+    camX: number,
+    camZ: number,
+    L: number,
+    gx: number,
+    gz: number,
+    desired: Map<string, { lodLevel: number; gridX: number; gridZ: number; dist: number }>,
+  ): void {
+    const cellSize = this.chunkSize * (1 << L);
+    const cx = (gx + 0.5) * cellSize;
+    const cz = (gz + 0.5) * cellSize;
+    const dist = Math.sqrt((cx - camX) ** 2 + (cz - camZ) ** 2);
+    const wantedLod = this.lodForDistance(dist);
+
+    if (wantedLod >= L || L === 0) {
+      // Keep this cell at LOD L
+      const key = `terrain_L${L}_${gx}_${gz}`;
+      desired.set(key, { lodLevel: L, gridX: gx, gridZ: gz, dist });
+    } else {
+      // Subdivide into 4 children at L-1
+      for (let dx = 0; dx < 2; dx++) {
+        for (let dz = 0; dz < 2; dz++) {
+          this.buildDesired(camX, camZ, L - 1, gx * 2 + dx, gz * 2 + dz, desired);
+        }
+      }
     }
   }
 
