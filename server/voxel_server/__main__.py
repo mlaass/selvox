@@ -19,9 +19,12 @@ def main() -> None:
         default=256,
         help="Procedural terrain size (if no file given)",
     )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.getLogger("websockets").setLevel(logging.INFO)
 
     if args.file:
         from .ingest import ingest_las
