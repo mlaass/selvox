@@ -6,3 +6,4 @@ bun.lockb
 server/data/
 *.docx
 *.docx#
+docs/mermaid-filter.err
