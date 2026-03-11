@@ -4,10 +4,10 @@ import numpy as np
 
 
 class VoxelGrid:
-    """Sparse patch grid with precomputed LOD pyramids."""
+    """Sparse patch grid with precomputed LOD pyramids, keyed by layer."""
 
     def __init__(self, resolution: float = 1.0) -> None:
-        self.patch_lods: dict[tuple[int, int, int], list[np.ndarray]] = {}
+        self.patch_lods: dict[int, dict[tuple[int, int, int], list[np.ndarray]]] = {}
         self.palette: list[tuple[int, int, int]] = []
         self.resolution = resolution
         # Tracked as max patch coord + 1 in each axis, times 64
@@ -17,7 +17,7 @@ class VoxelGrid:
     def world_size(self) -> tuple[int, int, int]:
         return (self._max_coords[0], self._max_coords[1], self._max_coords[2])
 
-    def add_patch(self, px: int, py: int, pz: int, data: np.ndarray) -> None:
+    def add_patch(self, layer: int, px: int, py: int, pz: int, data: np.ndarray) -> None:
         """Store a 64x64x64 uint8 array and precompute 6 coarser LOD levels."""
         assert data.shape == (64, 64, 64) and data.dtype == np.uint8
 
@@ -28,21 +28,40 @@ class VoxelGrid:
             current = self._downsample(current)
             lods[level] = current
 
-        self.patch_lods[(px, py, pz)] = lods
+        layer_dict = self.patch_lods.setdefault(layer, {})
+        layer_dict[(px, py, pz)] = lods
         self._max_coords[0] = max(self._max_coords[0], (px + 1) * 64)
         self._max_coords[1] = max(self._max_coords[1], (py + 1) * 64)
         self._max_coords[2] = max(self._max_coords[2], (pz + 1) * 64)
 
-    def get_patch(self, px: int, py: int, pz: int, level: int) -> np.ndarray | None:
+    def get_patch(self, layer: int, px: int, py: int, pz: int, level: int) -> np.ndarray | None:
         """Return precomputed LOD array, or None if patch is empty."""
-        lods = self.patch_lods.get((px, py, pz))
+        layer_dict = self.patch_lods.get(layer)
+        if layer_dict is None:
+            return None
+        lods = layer_dict.get((px, py, pz))
         if lods is None:
             return None
         return lods[level]
 
-    def list_patches(self) -> list[tuple[int, int, int]]:
-        """Return all non-empty patch coordinates."""
-        return list(self.patch_lods.keys())
+    def list_patches(self, layer: int) -> list[tuple[int, int, int]]:
+        """Return all non-empty patch coordinates in the given layer."""
+        layer_dict = self.patch_lods.get(layer)
+        if layer_dict is None:
+            return []
+        return list(layer_dict.keys())
+
+    def delete_patch(self, layer: int, px: int, py: int, pz: int) -> None:
+        """Remove a patch and all its LOD levels from the given layer."""
+        layer_dict = self.patch_lods.get(layer)
+        if layer_dict is not None:
+            layer_dict.pop((px, py, pz), None)
+            if not layer_dict:
+                del self.patch_lods[layer]
+
+    def list_layers(self) -> list[int]:
+        """Return all layers that currently contain data."""
+        return sorted(self.patch_lods.keys())
 
     @staticmethod
     def _downsample(data: np.ndarray) -> np.ndarray:

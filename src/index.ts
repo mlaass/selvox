@@ -17,3 +17,5 @@ export { PerlinNoise } from './noise.js';
 export type { FbmOptions } from './noise.js';
 export { TerrainSource } from './TerrainSource.js';
 export type { TerrainOptions } from './TerrainSource.js';
+export { WebSocketVoxelSource } from './ws/WebSocketVoxelSource.js';
+export type { WebSocketVoxelSourceOptions } from './ws/types.js';

@@ -5,6 +5,8 @@ export interface ChunkManagerOptions {
   radiusScale?: number;
   maxChunksPerFrame?: number;
   maxLodLevel?: number;
+  chunkSize?: number;
+  yExtent?: number;
 }
 
 interface ManagedChunk {
@@ -25,6 +27,8 @@ export class ChunkManager {
   private radiusScale: number;
   private maxChunksPerFrame: number;
   private maxLodLevel: number;
+  private chunkSize: number;
+  private yExtent: number;
 
   private managedChunks = new Map<string, ManagedChunk>();
   private pendingLoads = new Set<string>();
@@ -52,6 +56,8 @@ export class ChunkManager {
     this.radiusScale = opts?.radiusScale ?? DEFAULT_RADIUS_SCALE;
     this.maxChunksPerFrame = opts?.maxChunksPerFrame ?? DEFAULT_MAX_CHUNKS_PER_FRAME;
     this.maxLodLevel = opts?.maxLodLevel ?? DEFAULT_MAX_LOD;
+    this.chunkSize = opts?.chunkSize ?? BASE_CHUNK_SIZE;
+    this.yExtent = opts?.yExtent ?? 60;
   }
 
   async initialize(): Promise<void> {
@@ -66,8 +72,8 @@ export class ChunkManager {
     const camZ = cameraPosition[2];
 
     // Dirty-check: only recompute when camera crosses a LOD 0 grid boundary
-    const camGridX = Math.floor(camX / BASE_CHUNK_SIZE);
-    const camGridZ = Math.floor(camZ / BASE_CHUNK_SIZE);
+    const camGridX = Math.floor(camX / this.chunkSize);
+    const camGridZ = Math.floor(camZ / this.chunkSize);
 
     if (camGridX === this.lastCamGridX && camGridZ === this.lastCamGridZ && this.allDesiredLoaded) {
       return;
@@ -90,7 +96,7 @@ export class ChunkManager {
       }
 
       for (let L = 0; L <= this.maxLodLevel; L++) {
-        const chunkSize = BASE_CHUNK_SIZE * (1 << L);
+        const chunkSize = this.chunkSize * (1 << L);
         const outerRadius = this.radiusScale * (1 << L);
         const innerRadius = L > 0 ? this.radiusScale * (1 << (L - 1)) : 0;
 
@@ -140,7 +146,7 @@ export class ChunkManager {
       const toUnload: string[] = [];
       for (const [key, managed] of this.managedChunks) {
         if (!desired.has(key)) {
-          const chunkSize = BASE_CHUNK_SIZE * (1 << managed.lodLevel);
+          const chunkSize = this.chunkSize * (1 << managed.lodLevel);
           const cx = (managed.gridX + 0.5) * chunkSize;
           const cz = (managed.gridZ + 0.5) * chunkSize;
           const dx = cx - camX;
@@ -178,8 +184,8 @@ export class ChunkManager {
       const loadPromises = loadBatch.map(async (item) => {
         this.pendingLoads.add(item.key);
 
-        const chunkSize = BASE_CHUNK_SIZE * (1 << item.lodLevel);
-        const yExtent = 60;
+        const chunkSize = this.chunkSize * (1 << item.lodLevel);
+        const yExtent = this.yExtent;
         const minX = item.gridX * chunkSize;
         const minZ = item.gridZ * chunkSize;
         const bbox = new Float64Array([

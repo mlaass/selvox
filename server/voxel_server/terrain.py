@@ -115,7 +115,7 @@ def generate_terrain(size: int = 256, height: int = 64, seed: int = 42) -> Voxel
                                 patch[lx, ly, lz] = color_idx
                                 has_data = True
                 if has_data:
-                    grid.add_patch(px, py, pz, patch)
+                    grid.add_patch(0, px, py, pz, patch)
                     patch = np.zeros((64, 64, 64), dtype=np.uint8)
                     has_data = False
 

@@ -108,6 +108,6 @@ def ingest_las(path: str, resolution: float = 1.0) -> VoxelGrid:
             continue
         # Last-write-wins
         patch[lc[:, 0], lc[:, 1], lc[:, 2]] = pal
-        grid.add_patch(int(pc[0]), int(pc[1]), int(pc[2]), patch)
+        grid.add_patch(0, int(pc[0]), int(pc[1]), int(pc[2]), patch)
 
     return grid

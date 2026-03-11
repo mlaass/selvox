@@ -1,4 +1,4 @@
-import { VoxelRenderer, PerformanceOverlay, OverlayMode, PerlinNoise, FlyCamera, AAMode } from '../src/index.js';
+import { VoxelRenderer, PerformanceOverlay, OverlayMode, PerlinNoise, FlyCamera, AAMode, WebSocketVoxelSource, ChunkManager } from '../src/index.js';
 import { mat4Create, mat4Perspective } from '../src/gpu/math.js';
 
 const VOXEL_STRIDE = 64; // bytes per voxel
@@ -488,6 +488,116 @@ async function main() {
   sep3.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';
   panel.appendChild(sep3);
 
+  // Data source toggle
+  const srcRow = document.createElement('div');
+  srcRow.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:4px';
+  const srcLabel = document.createElement('span');
+  srcLabel.textContent = 'Source';
+  const srcSelect = document.createElement('select');
+  srcSelect.style.cssText = 'flex:1;cursor:pointer;background:#333;color:#ccc;border:1px solid #555;border-radius:2px;font:11px monospace;padding:1px 2px';
+  for (const name of ['Demo', 'WebSocket']) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    srcSelect.appendChild(opt);
+  }
+  srcRow.appendChild(srcLabel);
+  srcRow.appendChild(srcSelect);
+  panel.appendChild(srcRow);
+
+  // WebSocket URL + connect
+  const wsGroup = document.createElement('div');
+  wsGroup.style.cssText = 'display:none;margin-bottom:4px';
+
+  const urlInput = document.createElement('input');
+  urlInput.type = 'text';
+  urlInput.value = localStorage.getItem('selvox_ws_url') || 'ws://localhost:9876';
+  urlInput.style.cssText = 'width:100%;box-sizing:border-box;background:#222;color:#ccc;border:1px solid #555;border-radius:2px;font:11px monospace;padding:2px 4px;margin-bottom:4px';
+
+  const wsConnBtn = document.createElement('button');
+  wsConnBtn.textContent = 'Connect';
+  wsConnBtn.style.cssText = 'width:100%;background:#444;color:#ccc;border:1px solid #555;border-radius:2px;font:11px monospace;padding:2px 4px;cursor:pointer;margin-bottom:4px';
+
+  const wsStatus = document.createElement('div');
+  wsStatus.style.cssText = 'font:11px monospace;color:#888;margin-bottom:4px;word-break:break-all';
+
+  wsGroup.appendChild(urlInput);
+  wsGroup.appendChild(wsConnBtn);
+  wsGroup.appendChild(wsStatus);
+  panel.appendChild(wsGroup);
+
+  // WebSocket mode state
+  let wsSource: WebSocketVoxelSource | null = null;
+  let chunkManager: ChunkManager | null = null;
+
+  async function switchToWebSocket() {
+    const url = urlInput.value.trim();
+    localStorage.setItem('selvox_ws_url', url);
+    wsStatus.textContent = 'Connecting...';
+    wsStatus.style.color = '#cc0';
+
+    try {
+      // Unload demo chunks
+      renderer.unloadChunk('landscape');
+      renderer.unloadChunk('houses');
+
+      const source = new WebSocketVoxelSource({ url, resolution: 1.0 });
+      await source.connect();
+
+      const meta = await source.getMetadata();
+      const res = 1.0;
+      const patchWorld = 64 * res;
+      const worldHeight = meta.worldBounds[4]; // size_y * res
+
+      chunkManager = new ChunkManager(renderer, source, {
+        chunkSize: patchWorld,
+        radiusScale: 2 * patchWorld,
+        maxChunksPerFrame: 2,
+        maxLodLevel: meta.maxLodDepth,
+        yExtent: worldHeight / 2,
+      });
+      await chunkManager.initialize();
+
+      wsSource = source;
+      wsStatus.textContent = `Connected (${meta.maxLodDepth} LODs)`;
+      wsStatus.style.color = '#0c0';
+    } catch (err) {
+      wsStatus.textContent = `Error: ${(err as Error).message}`;
+      wsStatus.style.color = '#c00';
+      switchToDemo();
+      srcSelect.value = 'Demo';
+    }
+  }
+
+  function switchToDemo() {
+    if (chunkManager) {
+      chunkManager.unloadAll();
+      chunkManager = null;
+    }
+    if (wsSource) {
+      wsSource.disconnect();
+      wsSource = null;
+    }
+    // Reload demo world
+    const world = generateWorld();
+    renderer.loadChunk('landscape', world.landscape.data, world.landscape.count, new Float64Array([0, 0, 0]), 0);
+    renderer.loadChunk('houses', world.houses.data, world.houses.count, new Float64Array([0, 0, 0]), 0);
+  }
+
+  srcSelect.addEventListener('change', () => {
+    wsGroup.style.display = srcSelect.value === 'WebSocket' ? 'block' : 'none';
+    if (srcSelect.value === 'Demo') switchToDemo();
+  });
+
+  wsConnBtn.addEventListener('click', () => {
+    switchToWebSocket();
+  });
+
+  // Separator
+  const sep4 = document.createElement('hr');
+  sep4.style.cssText = 'border:none;border-top:1px solid #555;margin:6px 0';
+  panel.appendChild(sep4);
+
   // Stats section
   const statsDiv = document.createElement('div');
   statsDiv.style.cssText = 'white-space:pre';
@@ -527,6 +637,11 @@ async function main() {
     // Projection
     const aspect = canvas.width / canvas.height;
     mat4Perspective(proj, Math.PI / 4, aspect, 0.1, 10000);
+
+    // Update chunk manager if in WebSocket mode
+    if (chunkManager) {
+      chunkManager.update(camPos);
+    }
 
     // Render
     renderer.setTime(0);
